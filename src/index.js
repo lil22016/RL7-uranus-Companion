@@ -57,7 +57,7 @@ export class Companion extends DurableObject {
     cleared.pendingUser=Array.isArray(pending)?pending.length:0;
     this.put("pending:user",[]);
     const sessionPending=this.get("session:pending",[]); cleared.sessionPending=Array.isArray(sessionPending)?sessionPending.length:0;
-    this.put("session:pending",[]); this.put("session:deadline",null);
+    this.put("session:pending",[]); this.put("session:delivery",null); this.put("session:deadline",null);
     await this.arm();
     return j({ok:true,cleared,settingsPreserved:true,bridgeSettingsPreserved:true});
   }
@@ -117,23 +117,58 @@ export class Companion extends DurableObject {
   async touchSession(req){
     const b=await this.body(req), meaningful=this.meaningfulActions(b.actions);
     if(!meaningful.length)return j({ok:true,empty:true,pending:this.get("session:pending",[]).length});
-    const pending=[...this.get("session:pending",[]),...meaningful].slice(-50);
+    const stamped=meaningful.map(x=>({...x,eventId:String(x.eventId||crypto.randomUUID()),eventCreatedAt:String(x.eventCreatedAt||nowIso())}));
+    const pending=[...this.get("session:pending",[]),...stamped].slice(-100);
     this.put("session:pending",pending);
     const deadline=Date.now()+5*60*1000;
     this.put("session:deadline",deadline);
     await this.ctx.storage.setAlarm(deadline);
-    return j({ok:true,queued:meaningful.length,pending:pending.length,deadline:new Date(deadline).toISOString()});
+    return j({ok:true,queued:stamped.length,pending:pending.length,deadline:new Date(deadline).toISOString()});
   }
   async commitSession(req){
-    const b=await this.body(req), incoming=this.meaningfulActions(b.actions);
-    const stored=this.get("session:pending",[]), meaningful=[...stored,...incoming].slice(-50);
-    if(!meaningful.length)return j({ok:true,empty:true,pending:0});
-    const packet=this.compactActivity(meaningful);
-    const bridge=await this.pushBridge("session_activity",packet,{actor:"user",source:"companion",origin:"companion_ui"});
-    if(!bridge.ok)return j({ok:false,error:bridge.error||"Uranus Bridge push failed",bridge},502);
-    this.put("pending:user",[...this.get("pending:user",[]),...meaningful].slice(-30));
-    this.put("session:pending",[]); this.put("session:deadline",null);
-    return j({ok:true,actions:meaningful.length,bridge});
+    const b=await this.body(req), incoming=this.meaningfulActions(b.actions).map(x=>({...x,eventId:String(x.eventId||crypto.randomUUID()),eventCreatedAt:String(x.eventCreatedAt||nowIso())}));
+    let pending=[...this.get("session:pending",[]),...incoming].slice(-100);
+    if(!pending.length)return j({ok:true,empty:true,pending:0});
+
+    // Freeze a delivery snapshot. If transport/ACK is uncertain, retry this exact packet ID
+    // before sending newer actions. This gives at-least-once delivery without losing data.
+    let delivery=this.get("session:delivery",null);
+    if(!delivery){
+      const snapshot=pending.slice();
+      delivery={packetId:crypto.randomUUID(),eventIds:snapshot.map(x=>x.eventId),actions:snapshot,createdAt:nowIso()};
+      this.put("session:delivery",delivery);
+    }
+    const packet=this.compactActivity(delivery.actions);
+    const bridge=await this.pushBridge("session_activity",packet,{
+      actor:"user",source:"companion",origin:"companion_ui",
+      packetId:delivery.packetId,eventIds:delivery.eventIds
+    });
+    if(!bridge.ok){
+      // Never consume pending data on failure. A later manual/automatic push retries it.
+      return j({ok:false,error:bridge.error||"Uranus Bridge push failed",bridge,pending:pending.length,packetId:delivery.packetId},502);
+    }
+    if(!bridge.accepted || bridge.packetId!==delivery.packetId){
+      return j({ok:false,error:"Uranus did not return a matching delivery ACK. Session kept pending.",bridge,pending:pending.length,packetId:delivery.packetId},502);
+    }
+
+    const accepted=new Set(delivery.eventIds);
+    pending=this.get("session:pending",[]).filter(x=>!accepted.has(x.eventId));
+    this.put("pending:user",[...this.get("pending:user",[]),...delivery.actions].slice(-60));
+    this.put("session:pending",pending);
+    this.put("session:delivery",null);
+
+    // If actions arrived while an uncertain packet was being retried, send them now too.
+    // One button press therefore drains the whole pending queue, while each packet remains idempotent.
+    if(pending.length){
+      const nextReq=new Request("https://companion.local/api/session/commit",{method:"POST",headers:{"content-type":"application/json"},body:"{}"});
+      const next=await this.commitSession(nextReq);
+      if(!next.ok)return next;
+      const nextBody=await next.clone().json();
+      return j({ok:true,actions:delivery.actions.length+(nextBody.actions||0),bridge:nextBody.bridge||bridge,accepted:true,drained:true,pending:nextBody.pending||0});
+    }
+
+    this.put("session:deadline",null);
+    return j({ok:true,actions:delivery.actions.length,bridge,accepted:true,packetId:delivery.packetId,pending:0});
   }
   compactActivity(actions){
     return actions.slice(-20).map(a=>{
@@ -265,10 +300,10 @@ export class Companion extends DurableObject {
     if(!text)return {ok:false,error:"Nothing to push"};
     const url=this.bridgeUrl(b.url);
     try{
-      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","x-uranus-key":b.key||""},body:JSON.stringify({type,text,characterName:s.characterName,userName:s.userName,maxContextChars:b.maxContextChars,actor:meta.actor||((type==="character_summary"||type==="character_life")?"character":"user"),source:meta.source||"companion",origin:meta.origin||((type==="character_summary")?"companion_agent":"companion_ui"),createdAt:nowIso()})});
-      const responseText=(await r.text()).slice(0,500);
-      if(!r.ok)return {ok:false,status:r.status,url,error:`Uranus returned HTTP ${r.status}${responseText?`: ${responseText}`:""}`};
-      return {ok:true,status:r.status,url,response:responseText};
+      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","x-uranus-key":b.key||""},body:JSON.stringify({id:meta.packetId||crypto.randomUUID(),packetId:meta.packetId||null,eventIds:Array.isArray(meta.eventIds)?meta.eventIds:[],type,text,characterName:s.characterName,userName:s.userName,maxContextChars:b.maxContextChars,actor:meta.actor||((type==="character_summary"||type==="character_life")?"character":"user"),source:meta.source||"companion",origin:meta.origin||((type==="character_summary")?"companion_agent":"companion_ui"),createdAt:nowIso()})});
+      const responseText=(await r.text()).slice(0,2000); let response=null; try{response=JSON.parse(responseText)}catch{}
+      if(!r.ok)return {ok:false,status:r.status,url,error:`Uranus returned HTTP ${r.status}${responseText?`: ${responseText.slice(0,500)}`:""}`};
+      return {ok:true,status:r.status,url,response,accepted:response?.accepted===true,packetId:String(response?.packetId||"")};
     }catch(e){return {ok:false,url,error:`Failed to reach Uranus: ${e?.message||e}`};}
   }
   async arm(){ const s=this.settings(),deadline=Number(this.get("session:deadline",0))||0; if(deadline>Date.now()){await this.ctx.storage.setAlarm(deadline);return;} if(!s.autonomy.enabled||s.autonomy.maxVisits===0){ await this.ctx.storage.deleteAlarm(); return; } const min=Math.max(10,s.autonomy.minIntervalMinutes)*60000; await this.ctx.storage.setAlarm(Date.now()+min); }
