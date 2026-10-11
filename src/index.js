@@ -167,14 +167,27 @@ export class Companion extends DurableObject {
   }
   async saveSimplifiedSession(req){
     const b=await this.body(req),pending=this.get("session:pending",[]),text=String(b.text||"").trim();
-    if(!pending.length)return j({ok:false,error:"Nothing pending."},400);
     if(!text)return j({ok:false,error:"Simplified session cannot be empty."},400);
-    const item={text,fingerprint:this.sessionFingerprint(pending),createdAt:nowIso(),edited:true}; this.put("session:simplified",item); return j({ok:true,...item});
+    // Keep this editor usable even when there is no pending activity. That makes it a
+    // convenient manual test packet and avoids forcing the user to manufacture UI actions.
+    const item={text,fingerprint:this.sessionFingerprint(pending),createdAt:nowIso(),edited:true,manual:!pending.length}; this.put("session:simplified",item); return j({ok:true,...item});
   }
   async commitSession(req){
     const b=await this.body(req), representation=b.representation==="simplified"?"simplified":"original", incoming=this.meaningfulActions(b.actions).map(x=>({...x,eventId:String(x.eventId||crypto.randomUUID()),eventCreatedAt:String(x.eventCreatedAt||nowIso())}));
     let pending=[...this.get("session:pending",[]),...incoming].slice(-100);
-    if(!pending.length)return j({ok:true,empty:true,pending:0});
+    if(!pending.length){
+      // Manual Simplified Session test: it is intentionally allowed without pending UI
+      // actions. It goes through the exact same Uranus Bridge + ACK path, but consumes no
+      // pending events because there are none. Keep the editable text after success.
+      if(representation!=="simplified")return j({ok:true,empty:true,pending:0});
+      const simp=this.get("session:simplified",null), packet=String(simp?.text||"").trim();
+      if(!packet)return j({ok:false,error:"Simplified session is empty."},400);
+      const packetId=crypto.randomUUID();
+      const bridge=await this.pushBridge("session_activity",packet,{actor:"user",source:"companion",origin:"manual_simplified_test",packetId,eventIds:[]});
+      if(!bridge.ok)return j({ok:false,error:bridge.error||"Uranus Bridge push failed",bridge,pending:0,packetId},502);
+      if(!bridge.accepted||bridge.packetId!==packetId)return j({ok:false,error:"Uranus did not return a matching delivery ACK.",bridge,pending:0,packetId},502);
+      return j({ok:true,actions:0,manual:true,bridge,accepted:true,packetId,pending:0});
+    }
 
     // Freeze a delivery snapshot. If transport/ACK is uncertain, retry this exact packet ID
     // before sending newer actions. This gives at-least-once delivery without losing data.
