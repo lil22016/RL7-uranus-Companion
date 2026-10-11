@@ -45,3 +45,8 @@ body.settings-mode .app{display:none!important}
 .sessionPreviewHead span{font-size:12px;opacity:.62;white-space:nowrap}
 .sessionPreviewState{margin-top:7px;font-size:12px;opacity:.62;line-height:1.4}
 .sessionPreview pre{margin:10px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;max-height:220px;overflow:auto;color:inherit}
+
+/* Editable AI session compression */
+.simplifyBox textarea{width:100%;min-height:150px;margin-top:10px;resize:vertical;font:13px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
+.sessionActionRow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.sessionPreview>button{margin-top:10px}
+@media(max-width:560px){.sessionActionRow{grid-template-columns:1fr}}

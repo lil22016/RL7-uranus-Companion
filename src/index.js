@@ -41,6 +41,8 @@ export class Companion extends DurableObject {
     if(p==="/api/agent/run"&&m==="POST") return this.agentRun(req);
     if(p==="/api/session/touch"&&m==="POST") return this.touchSession(req);
     if(p==="/api/session/preview"&&m==="GET") return this.previewSession();
+    if(p==="/api/session/simplify"&&m==="POST") return this.simplifySession();
+    if(p==="/api/session/simplified"&&m==="PUT") return this.saveSimplifiedSession(req);
     if(p==="/api/session/commit"&&m==="POST") return this.commitSession(req);
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
@@ -58,7 +60,7 @@ export class Companion extends DurableObject {
     cleared.pendingUser=Array.isArray(pending)?pending.length:0;
     this.put("pending:user",[]);
     const sessionPending=this.get("session:pending",[]); cleared.sessionPending=Array.isArray(sessionPending)?sessionPending.length:0;
-    this.put("session:pending",[]); this.put("session:delivery",null); this.put("session:deadline",null);
+    this.put("session:pending",[]); this.put("session:delivery",null); this.put("session:deadline",null); this.put("session:simplified",null);
     await this.arm();
     return j({ok:true,cleared,settingsPreserved:true,bridgeSettingsPreserved:true});
   }
@@ -131,18 +133,44 @@ export class Companion extends DurableObject {
     const delivery=this.get("session:delivery",null);
     const deadline=Number(this.get("session:deadline",0))||0;
     const summary=pending.length?this.compactActivity(pending):"";
+    const simplified=this.get("session:simplified",null);
+    const fingerprint=this.sessionFingerprint(pending);
     return j({
-      ok:true,
-      pending:pending.length,
-      summary,
-      retrying:Boolean(delivery),
-      packetId:delivery?.packetId||null,
+      ok:true, pending:pending.length, summary,
+      simplified:simplified?.text||"", simplifiedCurrent:Boolean(simplified&&simplified.fingerprint===fingerprint),
+      simplifiedAt:simplified?.createdAt||null,
+      retrying:Boolean(delivery), packetId:delivery?.packetId||null,
       retryActions:Array.isArray(delivery?.actions)?delivery.actions.length:0,
       deadline:deadline?new Date(deadline).toISOString():null
     });
   }
+  sessionFingerprint(actions){ return (actions||[]).map(x=>x.eventId||"").join("|"); }
+  async simplifySession(){
+    const pending=this.get("session:pending",[]);
+    if(!pending.length)return j({ok:false,error:"Nothing pending to simplify."},400);
+    const s=this.settings(),profile=s.modelProfiles.find(x=>x.id===s.agent.profileId);
+    if(!profile)return j({ok:false,error:"Choose an active Companion model profile first."},400);
+    const original=this.compactActivity(pending);
+    const prompt=`You compress a Companion activity session for another AI that already knows the user and character. Minimize tokens aggressively WITHOUT losing any meaningful information.\n\nRULES:\n1. Preserve ALL meaningful facts, outcomes, status changes, emotions, relationship cues, jokes, requests, promises, concerns, and user intent from the source. Compression must never make information disappear merely because it seems casual.\n2. Merge duplicate lifecycle events about the same item (created/planned/updated/done/etc.) into one concise statement that reflects the final state while retaining any meaningful change.\n3. Merge reactions and comments aimed at the same character entry when natural.\n4. Short source wording may be kept verbatim when it is already efficient, especially distinctive emotional/relationship language. Long wording may be paraphrased, but its full semantic content must be carried forward.\n5. Preserve short direct quotes when their exact wording, humor, affection, teasing, or tone matters. Do not preserve long wording merely for style.\n6. Never invent, infer, embellish, correct, moralize, or add facts. Do not change who did what, chronology, completion status, or target.\n7. Do not summarize away details that could change how the receiving character understands or responds.\n8. Remove mechanical repetition, UI wording, redundant target text, and duplicated descriptions.\n9. Use compact plain text, usually one line per distinct semantic event. No headings, analysis, JSON, bullets unless truly needed.\n10. Aim for the fewest tokens possible AFTER satisfying all preservation rules. Accuracy and semantic completeness outrank brevity.\n\nReturn ONLY the compressed session text.`;
+    try{
+      const base=String(profile.baseUrl||"").replace(/\/$/,""),path=String(profile.path||"/chat/completions");
+      const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:`SOURCE SESSION:\n${original}`}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)})})});
+      if(!r.ok)throw new Error(`Companion model returned HTTP ${r.status}`);
+      const raw=await r.json();
+      const text=String(raw?.choices?.[0]?.message?.content||raw?.output_text||"").trim();
+      if(!text)throw new Error("Companion model returned an empty simplification.");
+      const item={text,fingerprint:this.sessionFingerprint(pending),createdAt:nowIso()}; this.put("session:simplified",item);
+      return j({ok:true,...item,original});
+    }catch(e){return j({ok:false,error:e.message||String(e)},400)}
+  }
+  async saveSimplifiedSession(req){
+    const b=await this.body(req),pending=this.get("session:pending",[]),text=String(b.text||"").trim();
+    if(!pending.length)return j({ok:false,error:"Nothing pending."},400);
+    if(!text)return j({ok:false,error:"Simplified session cannot be empty."},400);
+    const item={text,fingerprint:this.sessionFingerprint(pending),createdAt:nowIso(),edited:true}; this.put("session:simplified",item); return j({ok:true,...item});
+  }
   async commitSession(req){
-    const b=await this.body(req), incoming=this.meaningfulActions(b.actions).map(x=>({...x,eventId:String(x.eventId||crypto.randomUUID()),eventCreatedAt:String(x.eventCreatedAt||nowIso())}));
+    const b=await this.body(req), representation=b.representation==="simplified"?"simplified":"original", incoming=this.meaningfulActions(b.actions).map(x=>({...x,eventId:String(x.eventId||crypto.randomUUID()),eventCreatedAt:String(x.eventCreatedAt||nowIso())}));
     let pending=[...this.get("session:pending",[]),...incoming].slice(-100);
     if(!pending.length)return j({ok:true,empty:true,pending:0});
 
@@ -151,10 +179,12 @@ export class Companion extends DurableObject {
     let delivery=this.get("session:delivery",null);
     if(!delivery){
       const snapshot=pending.slice();
-      delivery={packetId:crypto.randomUUID(),eventIds:snapshot.map(x=>x.eventId),actions:snapshot,createdAt:nowIso()};
+      let packet=this.compactActivity(snapshot);
+      if(representation==="simplified"){ const simp=this.get("session:simplified",null); const fp=this.sessionFingerprint(snapshot); if(!simp||simp.fingerprint!==fp)return j({ok:false,error:"Simplified version is missing or outdated. Simplify again, or Push Original."},409); packet=simp.text; }
+      delivery={packetId:crypto.randomUUID(),eventIds:snapshot.map(x=>x.eventId),actions:snapshot,representation,packet,createdAt:nowIso()};
       this.put("session:delivery",delivery);
     }
-    const packet=this.compactActivity(delivery.actions);
+    const packet=delivery.packet||this.compactActivity(delivery.actions);
     const bridge=await this.pushBridge("session_activity",packet,{
       actor:"user",source:"companion",origin:"companion_ui",
       packetId:delivery.packetId,eventIds:delivery.eventIds
@@ -172,6 +202,7 @@ export class Companion extends DurableObject {
     this.put("pending:user",[...this.get("pending:user",[]),...delivery.actions].slice(-60));
     this.put("session:pending",pending);
     this.put("session:delivery",null);
+    this.put("session:simplified",null);
 
     // If actions arrived while an uncertain packet was being retried, send them now too.
     // One button press therefore drains the whole pending queue, while each packet remains idempotent.
