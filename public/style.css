@@ -50,3 +50,5 @@ body.settings-mode .app{display:none!important}
 .simplifyBox textarea{width:100%;min-height:150px;margin-top:10px;resize:vertical;font:13px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
 .sessionActionRow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.sessionPreview>button{margin-top:10px}
 @media(max-width:560px){.sessionActionRow{grid-template-columns:1fr}}
+
+.pushSimplifiedRow{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:10px}.pushSimplifiedRow #editSimplifyPrompt{white-space:nowrap}@media(max-width:560px){.pushSimplifiedRow{grid-template-columns:1fr 1fr}}

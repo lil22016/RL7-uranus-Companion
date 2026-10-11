@@ -10,7 +10,8 @@ const DEFAULTS = {
   reactionLibrary:["❤️","🙄","😂","😭","😒","🤨","😌","💀","👀"],
   agent:{profileId:"",persona:"",userPersona:"",worldbook:"",instructions:"Write briefly and naturally. Do not invent shared experiences. Do not react to everything."},
   modelProfiles:[],
-  bridge:{enabled:false,url:"",key:"",immediateReaction:"decide",maxContextChars:2800}
+  bridge:{enabled:false,url:"",key:"",immediateReaction:"decide",maxContextChars:2800},
+  simplifyPrompt:"You compress a Companion activity session for another AI that already knows the user and character. Minimize tokens aggressively WITHOUT losing meaningful information or temporal context.\n\nRULES:\n1. Preserve ALL meaningful facts, outcomes, status changes, emotions, relationship cues, jokes, requests, promises, concerns, and user intent. Compression must not make meaningful information disappear merely because it seems casual.\n2. Preserve TIME CONTEXT. Each source event includes its local date/time. Keep exact or concise time references whenever timing affects meaning, chronology, behavior, or how the receiving character may respond (for example: staying up late, waking early, deadlines, meals, appointments, travel, or something happening unusually late/early). For multiple events close together, you may state one shared time/range instead of repeating timestamps. Do not drop a time merely to save tokens when it changes the meaning.\n3. Merge duplicate lifecycle events about the same item (created/planned/updated/done/etc.) into one concise statement reflecting the final state while retaining meaningful changes.\n4. Merge reactions and comments aimed at the same character entry when natural.\n5. Short source wording that is already efficient may be kept verbatim, especially distinctive emotional/relationship language. Long wording may be paraphrased, but ALL meaningful semantic content must still be conveyed.\n6. Preserve short direct quotes when exact wording, humor, affection, teasing, or tone matters. Do not preserve long wording merely for style.\n7. Never invent, infer, embellish, correct, moralize, or add facts. Do not change actor, target, chronology, time, completion status, or intent.\n8. Do not summarize away details that could change how the receiving character understands or responds.\n9. Remove mechanical repetition, UI wording, redundant target text, and duplicated descriptions.\n10. Use compact plain text, usually one line per distinct semantic event. No headings, analysis, JSON, or explanatory preamble.\n11. Aim for the fewest tokens possible AFTER satisfying all preservation rules. Accuracy, semantic completeness, and relevant temporal context outrank brevity.\n\nReturn ONLY the compressed session text."
 };
 
 export class Companion extends DurableObject {
@@ -151,10 +152,11 @@ export class Companion extends DurableObject {
     const s=this.settings(),profile=s.modelProfiles.find(x=>x.id===s.agent.profileId);
     if(!profile)return j({ok:false,error:"Choose an active Companion model profile first."},400);
     const original=this.compactActivity(pending);
-    const prompt=`You compress a Companion activity session for another AI that already knows the user and character. Minimize tokens aggressively WITHOUT losing any meaningful information.\n\nRULES:\n1. Preserve ALL meaningful facts, outcomes, status changes, emotions, relationship cues, jokes, requests, promises, concerns, and user intent from the source. Compression must never make information disappear merely because it seems casual.\n2. Merge duplicate lifecycle events about the same item (created/planned/updated/done/etc.) into one concise statement that reflects the final state while retaining any meaningful change.\n3. Merge reactions and comments aimed at the same character entry when natural.\n4. Short source wording may be kept verbatim when it is already efficient, especially distinctive emotional/relationship language. Long wording may be paraphrased, but its full semantic content must be carried forward.\n5. Preserve short direct quotes when their exact wording, humor, affection, teasing, or tone matters. Do not preserve long wording merely for style.\n6. Never invent, infer, embellish, correct, moralize, or add facts. Do not change who did what, chronology, completion status, or target.\n7. Do not summarize away details that could change how the receiving character understands or responds.\n8. Remove mechanical repetition, UI wording, redundant target text, and duplicated descriptions.\n9. Use compact plain text, usually one line per distinct semantic event. No headings, analysis, JSON, bullets unless truly needed.\n10. Aim for the fewest tokens possible AFTER satisfying all preservation rules. Accuracy and semantic completeness outrank brevity.\n\nReturn ONLY the compressed session text.`;
+    const prompt=String(this.settings().simplifyPrompt||DEFAULTS.simplifyPrompt).trim()||DEFAULTS.simplifyPrompt;
+    const local=this.localNow();
     try{
       const base=String(profile.baseUrl||"").replace(/\/$/,""),path=String(profile.path||"/chat/completions");
-      const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:`SOURCE SESSION:\n${original}`}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)})})});
+      const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:`SESSION LOCAL TIMEZONE: ${local.timeZone}\nSIMPLIFICATION RUN LOCAL TIME: ${local.date} ${local.time}\nSOURCE SESSION (timestamps are local):\n${original}`}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)})})});
       if(!r.ok)throw new Error(`Companion model returned HTTP ${r.status}`);
       const raw=await r.json();
       const text=String(raw?.choices?.[0]?.message?.content||raw?.output_text||"").trim();
@@ -218,14 +220,17 @@ export class Companion extends DurableObject {
     return j({ok:true,actions:delivery.actions.length,bridge,accepted:true,packetId:delivery.packetId,pending:0});
   }
   compactActivity(actions){
+    const tz=this.settings().timezone||this.env.TZ||"America/New_York";
+    const stamp=a=>{try{const d=new Date(a.eventCreatedAt||a.createdAt||Date.now());const parts=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(d);const g=t=>parts.find(x=>x.type===t)?.value||"";return `[${g("year")}-${g("month")}-${g("day")} ${g("hour")}:${g("minute")}] `;}catch{return "";}};
     return actions.slice(-20).map(a=>{
-      if(a.type==="reaction")return `Raylee reacted ${a.emoji||""} to Loki's entry “${String(a.targetText||"").slice(0,120)}”.`;
-      if(a.type==="comment")return `Raylee commented on Loki's entry “${String(a.targetText||"").slice(0,100)}”: “${String(a.text||"").slice(0,180)}”.`;
-      if(a.type==="highlight")return `Raylee highlighted “${String(a.text||"").slice(0,160)}”.`;
-      if(a.type==="write_schedule")return `Raylee added to My Day: ${String(a.summary||"").slice(0,220)}.`;
-      if(a.type==="write_diary")return `${String(a.summary||"").slice(0,700)}`;
-      if(a.type==="update_schedule")return `Raylee updated a plan: ${String(a.summary||"").slice(0,300)}.`;
-      return String(a.summary||a.type);
+      const t=stamp(a);
+      if(a.type==="reaction")return `${t}Raylee reacted ${a.emoji||""} to Loki's entry “${String(a.targetText||"").slice(0,120)}”.`;
+      if(a.type==="comment")return `${t}Raylee commented on Loki's entry “${String(a.targetText||"").slice(0,100)}”: “${String(a.text||"").slice(0,180)}”.`;
+      if(a.type==="highlight")return `${t}Raylee highlighted “${String(a.text||"").slice(0,160)}”.`;
+      if(a.type==="write_schedule")return `${t}Raylee added to My Day: ${String(a.summary||"").slice(0,220)}.`;
+      if(a.type==="write_diary")return `${t}${String(a.summary||"").slice(0,700)}`;
+      if(a.type==="update_schedule")return `${t}Raylee updated a plan: ${String(a.summary||"").slice(0,300)}.`;
+      return `${t}${String(a.summary||a.type)}`;
     }).join("\n");
   }
   localNow(){
