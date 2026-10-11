@@ -28,7 +28,6 @@ export class Companion extends DurableObject {
     if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
     if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse()});
     if(p==="/api/settings"&&m==="PUT") return this.setSettings(req);
-    if(p==="/api/admin/fresh-start"&&m==="POST") return this.freshStart();
     if(p==="/api/schedule"&&m==="POST") return this.createSchedule(req);
     if(p.startsWith("/api/schedule/")&&m==="PATCH") return this.patch("schedule",p.split("/").pop(),req);
     if(p.startsWith("/api/schedule/")&&m==="DELETE") return this.remove("schedule",p.split("/").pop());
@@ -45,19 +44,6 @@ export class Companion extends DurableObject {
   }
   async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; const got=req.headers.get("x-companion-key")||""; return got===secret; }
   async body(req){ try{return await req.json();}catch{return{};} }
-  async freshStart(){
-    const kinds=["schedule","diary","comments","reactions","highlights","notifications"];
-    const deleted={};
-    for(const kind of kinds){
-      const items=this.list(kind);
-      deleted[kind]=items.length;
-      this.save(kind,[]);
-    }
-    const pending=this.get("pending:user",[]);
-    deleted.pendingUser=Array.isArray(pending)?pending.length:0;
-    this.put("pending:user",[]);
-    return j({ok:true,freshStart:true,deleted,settingsPreserved:true});
-  }
   async setSettings(req){ const b=await this.body(req); const old=this.settings(); const a=b.autonomy||{}; const next={...old,...b,autonomy:{...old.autonomy,...a,minVisits:clamp(a.minVisits??old.autonomy.minVisits,0,10),maxVisits:clamp(a.maxVisits??old.autonomy.maxVisits,0,10),minIntervalMinutes:clamp(a.minIntervalMinutes??old.autonomy.minIntervalMinutes,0,1440)},reactionLibrary:[...new Set((b.reactionLibrary??old.reactionLibrary).map(String))].slice(0,50)}; if(next.autonomy.maxVisits<next.autonomy.minVisits)next.autonomy.maxVisits=next.autonomy.minVisits; this.put("settings",next); await this.arm(); return j({ok:true,settings:next}); }
   async createSchedule(req){ const b=await this.body(req); const x={id:id("s"),owner:"user",date:String(b.date||"").slice(0,10),time:String(b.time||"").slice(0,5),end:String(b.end||"").slice(0,5),text:String(b.text||"").trim(),status:"planned",createdAt:nowIso(),updatedAt:nowIso()}; if(!x.date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("schedule",x); return j({ok:true,item:x}); }
   async createDiary(req){ const b=await this.body(req); const owner="user", date=String(b.date||"").slice(0,10); let arr=this.list("diary"); const existing=arr.find(x=>x.owner===owner&&x.date===date); if(existing){ const item=this.update("diary",existing.id,{text:String(b.text||"").trim()}); return j({ok:true,item}); } const x={id:id("d"),owner,date,text:String(b.text||"").trim(),createdAt:nowIso(),updatedAt:nowIso()}; if(!date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("diary",x); return j({ok:true,item:x}); }
