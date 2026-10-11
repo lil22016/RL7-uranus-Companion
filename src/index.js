@@ -186,6 +186,9 @@ export class Companion extends DurableObject {
       const bridge=await this.pushBridge("session_activity",packet,{actor:"user",source:"companion",origin:"manual_simplified_test",packetId,eventIds:[]});
       if(!bridge.ok)return j({ok:false,error:bridge.error||"Uranus Bridge push failed",bridge,pending:0,packetId},502);
       if(!bridge.accepted||bridge.packetId!==packetId)return j({ok:false,error:"Uranus did not return a matching delivery ACK.",bridge,pending:0,packetId},502);
+      // ACK confirmed: consume the manual simplified text as well. A successful Push
+      // must visibly empty the editor so it cannot be mistaken for an unsent packet.
+      this.put("session:simplified",null);
       return j({ok:true,actions:0,manual:true,bridge,accepted:true,packetId,pending:0});
     }
 
