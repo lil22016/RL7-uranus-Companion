@@ -7,3 +7,8 @@
 .settingsPage{padding-bottom:30px}.settingsPageHead{display:flex;align-items:center;gap:15px;margin:2px 0 20px}.settingsPageHead h2{font-size:34px;margin:3px 0 0}.settingsPageHead small{font-size:9px;letter-spacing:.2em;color:#b9afa7}.settingsSurface{background:linear-gradient(135deg,#ffffff1d,#ffffff09);border:1px solid #ffffff30;border-radius:25px;padding:22px;box-shadow:0 16px 55px #0003;backdrop-filter:blur(30px);-webkit-backdrop-filter:blur(30px)}.settingsPage h3{grid-column:1/-1;margin-top:24px;padding-top:18px;border-top:1px solid #ffffff1e}.settingsPage h3:first-of-type{margin-top:8px}.notificationToggle span{display:flex;flex-direction:column;gap:4px}.notificationToggle b{font-size:13px;color:#f1ece9}.notificationToggle small{font-size:10px;color:#a9a4aa}.settingsPage .settingsGrid+.primary{margin-top:0}
 @media(max-width:560px){.calendarGrid,.weekHead{gap:4px}.calDay{border-radius:9px}.monthCalendar{padding-left:10px;padding-right:10px}.settingsSurface{padding:18px 15px}.calendarBar{grid-template-columns:38px 1fr 38px 38px}}
 .quickDialog textarea{display:block;width:100%;max-width:100%;min-width:0;min-height:120px;border:1px solid #ffffff36;border-radius:14px;background:#ffffff10;padding:13px 14px;font-size:16px;color:#fff;outline:none;resize:vertical;box-shadow:inset 0 1px 1px #0002}.quickDialog textarea:focus{border-color:#d6c2a8;background:#ffffff19}
+
+/* Patch 2.4 — interaction alignment + settings page entry */
+.thread{margin-left:40px}
+.diaryText + .thread{margin-left:40px}
+@media(max-width:560px){.thread,.diaryText + .thread{margin-left:28px}}
