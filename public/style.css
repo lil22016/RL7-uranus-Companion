@@ -25,3 +25,15 @@ body.settings-mode .app{display:none!important}
 /* Patch 2.6 — keep diary interaction rail aligned, add breathing room inside it */
 .diaryText + .thread{margin-left:0;padding-left:18px}
 @media(max-width:560px){.diaryText + .thread{margin-left:0;padding-left:14px}}
+
+/* Patch 2.6 — Settings is a true page, not a floating glass card */
+#settingsPage .settingsSurface{
+  background:transparent;
+  border:0;
+  border-radius:0;
+  padding:0;
+  box-shadow:none;
+  backdrop-filter:none;
+  -webkit-backdrop-filter:none;
+}
+@media(max-width:560px){#settingsPage .settingsSurface{padding:0}}
