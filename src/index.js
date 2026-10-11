@@ -96,8 +96,27 @@ export class Companion extends DurableObject {
     if(!diary||diary.owner!=="character")return j({ok:false,error:"Only the character's diary can be highlighted"},403);
     const x={id:id("h"),actor:"user",diaryId:diary.id,text:String(b.text||""),start:Number(b.start)||0,end:Number(b.end)||0,createdAt:nowIso()};
     if(!x.text)return j({ok:false,error:"Text required"},400);this.add("highlights",x);return j({ok:true,item:x}); }
-  async commitSession(req){ const b=await this.body(req), actions=Array.isArray(b.actions)?b.actions:[]; if(!actions.length)return j({ok:true,empty:true}); const meaningful=actions.filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule"].includes(x.type)); if(!meaningful.length)return j({ok:true,empty:true}); this.put("pending:user",[...this.get("pending:user",[]),...meaningful].slice(-30)); await this.pushBridge("user_activity",this.compactActivity(meaningful)); return j({ok:true}); }
-  compactActivity(actions){ return actions.slice(-8).map(a=>{ if(a.type==="reaction")return `${a.emoji||"reacted"} on “${String(a.targetText||"").slice(0,80)}”`; if(a.type==="comment")return `Comment on “${String(a.targetText||"").slice(0,60)}”: “${String(a.text||"").slice(0,100)}”`; if(a.type==="highlight")return `Highlighted “${String(a.text||"").slice(0,100)}”`; return String(a.summary||a.type); }).join("\n"); }
+  async commitSession(req){
+    const b=await this.body(req), actions=Array.isArray(b.actions)?b.actions:[];
+    if(!actions.length)return j({ok:true,empty:true});
+    const meaningful=actions.filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule"].includes(x.type));
+    if(!meaningful.length)return j({ok:true,empty:true});
+    const packet=this.compactActivity(meaningful);
+    this.put("pending:user",[...this.get("pending:user",[]),...meaningful].slice(-30));
+    await this.pushBridge("session_activity",packet,{actor:"user",source:"companion",origin:"companion_ui"});
+    return j({ok:true,actions:meaningful.length});
+  }
+  compactActivity(actions){
+    return actions.slice(-20).map(a=>{
+      if(a.type==="reaction")return `Raylee reacted ${a.emoji||""} to Loki's entry “${String(a.targetText||"").slice(0,120)}”.`;
+      if(a.type==="comment")return `Raylee commented on Loki's entry “${String(a.targetText||"").slice(0,100)}”: “${String(a.text||"").slice(0,180)}”.`;
+      if(a.type==="highlight")return `Raylee highlighted “${String(a.text||"").slice(0,160)}”.`;
+      if(a.type==="write_schedule")return `Raylee added to My Day: ${String(a.summary||"").slice(0,220)}.`;
+      if(a.type==="write_diary")return `${String(a.summary||"").slice(0,700)}`;
+      if(a.type==="update_schedule")return `Raylee updated a plan: ${String(a.summary||"").slice(0,300)}.`;
+      return String(a.summary||a.type);
+    }).join("\n");
+  }
   localDate(){return new Intl.DateTimeFormat("en-CA",{timeZone:this.settings().timezone||this.env.TZ||"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());}
   async agentRun(req){
     const b=await this.body(req);
