@@ -21,3 +21,7 @@ body.settings-mode .app{display:none!important}
 .diaryText + .thread{margin-left:0}
 .diaryText + .thread,.diaryTools{padding-left:0}
 @media(max-width:560px){.time{flex-basis:46px}.row{gap:8px}.diaryText + .thread{margin-left:0}}
+
+/* Patch 2.6 — keep diary interaction rail aligned, add breathing room inside it */
+.diaryText + .thread{margin-left:0;padding-left:18px}
+@media(max-width:560px){.diaryText + .thread{margin-left:0;padding-left:14px}}
