@@ -1,0 +1,18 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Companion</title><link rel="stylesheet" href="/style.css"></head><body>
+<div class="app"><header><div><small>SHARED SPACE</small><h1 id="title">Companion</h1></div><button id="settingsBtn" class="icon">⚙︎</button></header>
+<nav><button data-page="calendar" class="active">Calendar</button><button data-page="diary">Diary</button><button data-page="activity">Activity</button></nav>
+<main>
+<section id="calendar" class="page active"><div class="datebar"><button id="prevDay">‹</button><input id="date" type="date"><button id="nextDay">›</button></div><div id="charDay" class="panel"></div><div id="userDay" class="panel"></div></section>
+<section id="diary" class="page"><div class="datebar"><button id="prevDiary">‹</button><input id="diaryDate" type="date"><button id="nextDiary">›</button></div><div class="seg"><button data-owner="character" class="active">Loki's Diary</button><button data-owner="user">My Diary</button></div><div id="diaryCard" class="panel diary"></div></section>
+<section id="activity" class="page"><div class="panel"><h2>Activity</h2><div id="notifications"></div></div></section>
+</main></div>
+<dialog id="settings"><form method="dialog"><div class="modalHead"><h2>Settings</h2><button>Done</button></div><div class="settingsGrid">
+<label>Character name<input id="characterName"></label><label>Your name<input id="userName"></label><label>Timezone<input id="timezone" placeholder="America/New_York"></label>
+<h3>Autonomous visits</h3><label class="toggle">Enabled<input id="autoEnabled" type="checkbox"></label><label>Daily minimum<input id="minVisits" type="number" min="0" max="10"></label><label>Daily maximum<input id="maxVisits" type="number" min="0" max="10"></label><label>Minimum interval (minutes)<input id="minInterval" type="number" min="0"></label><label>Active from<input id="activeStart" type="time"></label><label>Active until<input id="activeEnd" type="time"></label>
+<h3>Reaction library</h3><label class="wide">Emoji list <span class="hint">space separated</span><input id="emojiList"></label>
+<h3>Character instructions</h3><label class="wide">Persona<textarea id="persona"></textarea></label><label class="wide">User persona<textarea id="userPersona"></textarea></label><label class="wide">Worldbook<textarea id="worldbook"></textarea></label><label class="wide">Companion instructions<textarea id="instructions"></textarea></label>
+<h3>Model profiles</h3><div id="profiles" class="wide"></div><button type="button" id="addProfile" class="wide secondary">+ Add model profile</button><label class="wide">Active model<select id="activeProfile"></select></label>
+<h3>Uranus bridge</h3><label class="toggle">Enabled<input id="bridgeEnabled" type="checkbox"></label><label class="wide">Bridge URL<input id="bridgeUrl" placeholder="leave blank for now"></label><label class="wide">Bridge key<input id="bridgeKey" type="password"></label>
+<button type="button" id="saveSettings" class="primary wide">Save settings</button></div></form></dialog>
+<dialog id="edit"><form method="dialog"><div class="modalHead"><h2 id="editTitle">Add</h2><button>Cancel</button></div><div id="editBody" class="settingsGrid"></div><button type="button" id="editSave" class="primary">Save</button></form></dialog>
+<div id="toast"></div><script src="/app.js"></script></body></html>
