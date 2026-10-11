@@ -12,3 +12,12 @@
 .thread{margin-left:40px}
 .diaryText + .thread{margin-left:40px}
 @media(max-width:560px){.thread,.diaryText + .thread{margin-left:28px}}
+
+/* Patch 2.5 — shared date, diary alignment, true full-page settings */
+body.settings-mode .app{display:none!important}
+#settingsPage.active{display:block;width:min(920px,100%);margin:0 auto;padding:calc(env(safe-area-inset-top) + 18px) max(18px,env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 30px) max(18px,env(safe-area-inset-left));min-height:100dvh}
+.row{gap:8px}
+.time{flex-basis:46px}
+.diaryText + .thread{margin-left:0}
+.diaryText + .thread,.diaryTools{padding-left:0}
+@media(max-width:560px){.time{flex-basis:46px}.row{gap:8px}.diaryText + .thread{margin-left:0}}
