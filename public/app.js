@@ -68,5 +68,17 @@ function readProfiles(){return $$('.profile').map((e,i)=>({id:profileDraft[i]?.i
 function syncProfileSelect(active){const ps=readProfiles();$('#activeProfile').innerHTML='<option value="">None</option>'+ps.map(p=>`<option value="${attr(p.id)}" ${p.id===active?'selected':''}>${esc(p.name||p.model||'Unnamed')}</option>`).join('')}
 $('#addProfile').onclick=()=>{const active=$('#activeProfile').value;const ps=readProfiles();ps.push({id:crypto.randomUUID(),name:'',model:'',baseUrl:'',apiKey:'',path:'/chat/completions',temperature:null,_open:true});renderProfiles(ps,active);$$('.profile').at(-1)?.scrollIntoView({behavior:'smooth',block:'center'})};
 $('#saveSettings').onclick=async()=>{const profiles=readProfiles().map(({_open,...p})=>p);const body={characterName:$('#characterName').value,userName:$('#userName').value,timezone:$('#timezone').value,autonomy:{enabled:$('#autoEnabled').checked,minVisits:+$('#minVisits').value,maxVisits:+$('#maxVisits').value,minIntervalMinutes:+$('#minInterval').value,activeStart:$('#activeStart').value,activeEnd:$('#activeEnd').value},reactionLibrary:$('#emojiList').value.trim().split(/\s+/).filter(Boolean),agent:{...data.settings.agent,profileId:$('#activeProfile').value,persona:$('#persona').value,userPersona:$('#userPersona').value,worldbook:$('#worldbook').value,instructions:$('#instructions').value},modelProfiles:profiles,bridge:{...data.settings.bridge,enabled:false,url:$('#bridgeUrl').value,key:$('#bridgeKey').value}};try{await api('/settings',{method:'PUT',body:JSON.stringify(body)});await load();renderProfiles(data.settings.modelProfiles,data.settings.agent.profileId);toast('Saved')}catch(e){toast(e.message)}};
+$('#freshStartBtn').onclick=async()=>{
+  const first=confirm('Clear ALL Calendar, Diary, Activity, reactions and comments from the Companion? Settings will be kept.');
+  if(!first)return;
+  const second=confirm('This permanently deletes the current Companion test content. Continue with Fresh Start?');
+  if(!second)return;
+  try{
+    const r=await api('/admin/fresh-start',{method:'POST',body:'{}'});
+    await load();
+    toast(`Fresh Start complete · ${Object.values(r.deleted||{}).reduce((a,b)=>a+(Number(b)||0),0)} test records cleared`);
+  }catch(e){toast(e.message)}
+};
+
 function esc(s=''){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function attr(s=''){return esc(s)}
 load();
