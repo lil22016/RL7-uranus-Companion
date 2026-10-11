@@ -117,7 +117,13 @@ export class Companion extends DurableObject {
       return String(a.summary||a.type);
     }).join("\n");
   }
-  localDate(){return new Intl.DateTimeFormat("en-CA",{timeZone:this.settings().timezone||this.env.TZ||"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());}
+  localNow(){
+    const timeZone=this.settings().timezone||this.env.TZ||"America/New_York";
+    const parts=new Intl.DateTimeFormat("en-US",{timeZone,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(new Date());
+    const get=t=>parts.find(x=>x.type===t)?.value||"";
+    return {date:`${get("year")}-${get("month")}-${get("day")}`,time:`${get("hour")}:${get("minute")}`,timeZone};
+  }
+  localDate(){return this.localNow().date;}
   async agentRun(req){
     const b=await this.body(req);
     const mode=["look_schedule","write_schedule","look_diary","write_diary","autonomous"].includes(b.mode)?b.mode:"autonomous";
@@ -145,9 +151,12 @@ export class Companion extends DurableObject {
     const s=this.settings(),profile=s.modelProfiles.find(x=>x.id===s.agent.profileId);
     if(!profile)throw new Error("Choose a model profile in Settings first.");
     const pending=this.get("pending:user",[]),date=/^\d{4}-\d{2}-\d{2}$/.test(requestedDate||"")?requestedDate:this.localDate();
+    const localNow=this.localNow();
+    if((mode==="write_schedule"||mode==="write_diary")&&date>localNow.date)throw new Error("Ask Loki to Write cannot invent lived events for a future date.");
     const userScheduleForDate=this.list("schedule").filter(x=>x.owner==="user"&&x.date===date);
     const userDiaryForDate=this.list("diary").filter(x=>x.owner==="user"&&x.date===date);
-    const instruction=mode==="write_schedule"?`MANDATORY: Create at least ONE nonempty schedule item in the schedule array for ${date}. You are writing YOUR OWN day, not merely looking. If uncertain, write a small believable everyday plan or activity. Do not leave schedule empty.`:mode==="write_diary"?`MANDATORY: Write a nonempty diary object {"date":"${date}","text":"..."}. Write YOUR OWN diary, even if it is just 1-2 natural sentences. Do not return null diary.`:mode==="look_schedule"?`LOOK ONLY at the user's schedule. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on a USER schedule entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every schedule interaction, targetType MUST be "schedule" and targetId MUST be an exact schedule id shown in ELIGIBLE TARGETS. Never return with both comments and reactions empty.`:mode==="look_diary"?`LOOK ONLY at the user's diary. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on the USER diary entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every diary interaction, targetType MUST be "diary" and targetId MUST be the exact diary id shown in ELIGIBLE TARGETS. Never use "schedule" for a diary interaction. Never return with both comments and reactions empty.`:`Visit naturally. You may write your own schedule/diary or interact with the USER's entries, or do nothing.`;
+    const todayWriteRule=date===localNow.date?`TODAY SAFETY RULE: It is currently ${localNow.time} in ${localNow.timeZone}. Write ONLY events that have already happened or are happening now. NEVER invent, predict, pre-fill, or schedule events later than ${localNow.time}. For schedule writing today, every new schedule item MUST include an explicit HH:MM start time that is not later than ${localNow.time}; any end time must also not be later than ${localNow.time}. If only one real/present activity is appropriate, write only one. Do not fill the rest of the day.`:`The target date is in the past, so you may describe events from that completed day.`;
+    const instruction=mode==="write_schedule"?`MANDATORY: Create at least ONE nonempty schedule item in the schedule array for ${date}. You are writing YOUR OWN lived day, not merely looking. Do not invent content just to fill the calendar. ${todayWriteRule}`:mode==="write_diary"?`MANDATORY: Write a nonempty diary object {"date":"${date}","text":"..."}. Write YOUR OWN diary, even if it is just 1-2 natural sentences. Do not return null diary. ${todayWriteRule}`:mode==="look_schedule"?`LOOK ONLY at the user's schedule. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on a USER schedule entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every schedule interaction, targetType MUST be "schedule" and targetId MUST be an exact schedule id shown in ELIGIBLE TARGETS. Never return with both comments and reactions empty.`:mode==="look_diary"?`LOOK ONLY at the user's diary. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on the USER diary entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every diary interaction, targetType MUST be "diary" and targetId MUST be the exact diary id shown in ELIGIBLE TARGETS. Never use "schedule" for a diary interaction. Never return with both comments and reactions empty.`:`Visit naturally. You may write your own schedule/diary or interact with the USER's entries, or do nothing.`;
     const prompt=`You are ${s.characterName}. Return ONLY valid JSON.\nMODE: ${mode}\nTARGET DATE: ${date}\nLOCAL TIMEZONE: ${s.timezone}\nCURRENT UTC: ${nowIso()}\nIMPORTANT INSTRUCTION: ${instruction}\nYou can change the status of YOUR OWN existing schedules using updates [{"id":"existing id","status":"done|failed|cancelled|changed","actualText":"required only for changed"}]. Do not edit or delete original schedule text.\nYou can ONLY comment/react to the USER's existing entries. Never comment/react to your own.\nPERSONA:\n${s.agent.persona}\nUSER:\n${s.agent.userPersona}\nWORLDBOOK:\n${s.agent.worldbook}\nSPECIAL INSTRUCTIONS:\n${s.agent.instructions}\nAVAILABLE REACTIONS: ${s.reactionLibrary.join(" ")}\nELIGIBLE TARGETS FOR THIS REQUEST:\n${mode==="look_diary"?JSON.stringify(userDiaryForDate):mode==="look_schedule"?JSON.stringify(userScheduleForDate):"n/a"}\nINTERACTION JSON SCHEMA: comments use {"targetType":"schedule|diary","targetId":"exact existing id","text":"..."}; reactions use {"targetType":"schedule|diary","targetId":"exact existing id","emoji":"one AVAILABLE REACTION"}.\nRECENT USER ACTIVITY:\n${this.compactActivity(pending)}\nYOUR SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="character").slice(-30))}\nUSER SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="user").slice(-30))}\nYOUR DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="character").slice(-7))}\nUSER DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="user").slice(-7))}\nReturn JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reactions":[],"summary":{"diary":"","schedule":[]},"messageNow":null}. schedule items use {"date":"${date}","time":"HH:MM or empty","end":"HH:MM or empty","text":"..."}. Comments/reactions must target existing USER entry IDs only.`;
     const base=String(profile.baseUrl||"").replace(/\/$/,"");const path=profile.path||"/chat/completions";
     const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:mode.startsWith("write_")?`Write the required ${mode==="write_schedule"?"schedule":"diary"} for ${date} now. Return a nonempty result.`:mode.startsWith("look_")?`Look at the requested user content now and MUST leave at least one valid reaction or comment on it.`:"Decide what you naturally do this visit."}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)}),response_format:{type:"json_object"}})});
@@ -161,10 +170,20 @@ export class Companion extends DurableObject {
     const dateNow=/^\d{4}-\d{2}-\d{2}$/.test(requestedDate||"")?requestedDate:this.localDate();
     const outcome={schedule:0,diary:0,updates:0,comments:0,reactions:0};
     const writeSchedule=mode==="write_schedule"||mode==="autonomous",writeDiary=mode==="write_diary"||mode==="autonomous";
-    if(writeSchedule)for(const x of (Array.isArray(o.schedule)?o.schedule:[]).slice(0,10)){
-      if(!String(x.text||"").trim())continue;
-      const item={id:id("s"),owner:"character",date:dateNow,time:String(x.time||"").slice(0,5),end:String(x.end||"").slice(0,5),text:String(x.text).trim().slice(0,1000),status:"planned",createdAt:nowIso(),updatedAt:nowIso()};
-      this.add("schedule",item);outcome.schedule++;
+    if(writeSchedule){
+      const localNow=this.localNow();
+      if(dateNow>localNow.date)throw new Error("Refusing to save invented future schedule entries.");
+      for(const x of (Array.isArray(o.schedule)?o.schedule:[]).slice(0,10)){
+        if(!String(x.text||"").trim())continue;
+        const start=String(x.time||"").slice(0,5),end=String(x.end||"").slice(0,5);
+        if(dateNow===localNow.date){
+          if(!/^\d{2}:\d{2}$/.test(start))continue;
+          if(start>localNow.time)continue;
+          if(end&&(/^\d{2}:\d{2}$/.test(end)?end>localNow.time:true))continue;
+        }
+        const item={id:id("s"),owner:"character",date:dateNow,time:start,end,text:String(x.text).trim().slice(0,1000),status:"planned",createdAt:nowIso(),updatedAt:nowIso()};
+        this.add("schedule",item);outcome.schedule++;
+      }
     }
     if(mode==="autonomous")for(const x of (Array.isArray(o.updates)?o.updates:[]).slice(0,12)){
       const old=this.list("schedule").find(z=>z.id===x.id&&z.owner==="character");
