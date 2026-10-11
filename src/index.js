@@ -39,6 +39,7 @@ export class Companion extends DurableObject {
     if(p==="/api/reaction"&&m==="POST") return this.createReaction(req);
     if(p==="/api/highlight"&&m==="POST") return this.createHighlight(req);
     if(p==="/api/agent/run"&&m==="POST") return this.agentRun(req);
+    if(p==="/api/session/touch"&&m==="POST") return this.touchSession(req);
     if(p==="/api/session/commit"&&m==="POST") return this.commitSession(req);
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
@@ -55,6 +56,9 @@ export class Companion extends DurableObject {
     const pending=this.get("pending:user",[]);
     cleared.pendingUser=Array.isArray(pending)?pending.length:0;
     this.put("pending:user",[]);
+    const sessionPending=this.get("session:pending",[]); cleared.sessionPending=Array.isArray(sessionPending)?sessionPending.length:0;
+    this.put("session:pending",[]); this.put("session:deadline",null);
+    await this.arm();
     return j({ok:true,cleared,settingsPreserved:true,bridgeSettingsPreserved:true});
   }
   async setSettings(req){ const b=await this.body(req); const old=this.settings(); const a=b.autonomy||{}; const next={...old,...b,autonomy:{...old.autonomy,...a,minVisits:clamp(a.minVisits??old.autonomy.minVisits,0,10),maxVisits:clamp(a.maxVisits??old.autonomy.maxVisits,0,10),minIntervalMinutes:clamp(a.minIntervalMinutes??old.autonomy.minIntervalMinutes,0,1440)},reactionLibrary:[...new Set((b.reactionLibrary??old.reactionLibrary).map(String))].slice(0,50)}; if(next.autonomy.maxVisits<next.autonomy.minVisits)next.autonomy.maxVisits=next.autonomy.minVisits; this.put("settings",next); await this.arm(); return j({ok:true,settings:next}); }
@@ -109,15 +113,27 @@ export class Companion extends DurableObject {
     if(!diary||diary.owner!=="character")return j({ok:false,error:"Only the character's diary can be highlighted"},403);
     const x={id:id("h"),actor:"user",diaryId:diary.id,text:String(b.text||""),start:Number(b.start)||0,end:Number(b.end)||0,createdAt:nowIso()};
     if(!x.text)return j({ok:false,error:"Text required"},400);this.add("highlights",x);return j({ok:true,item:x}); }
+  meaningfulActions(actions){ return (Array.isArray(actions)?actions:[]).filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule"].includes(x?.type)); }
+  async touchSession(req){
+    const b=await this.body(req), meaningful=this.meaningfulActions(b.actions);
+    if(!meaningful.length)return j({ok:true,empty:true,pending:this.get("session:pending",[]).length});
+    const pending=[...this.get("session:pending",[]),...meaningful].slice(-50);
+    this.put("session:pending",pending);
+    const deadline=Date.now()+5*60*1000;
+    this.put("session:deadline",deadline);
+    await this.ctx.storage.setAlarm(deadline);
+    return j({ok:true,queued:meaningful.length,pending:pending.length,deadline:new Date(deadline).toISOString()});
+  }
   async commitSession(req){
-    const b=await this.body(req), actions=Array.isArray(b.actions)?b.actions:[];
-    if(!actions.length)return j({ok:true,empty:true});
-    const meaningful=actions.filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule"].includes(x.type));
-    if(!meaningful.length)return j({ok:true,empty:true});
+    const b=await this.body(req), incoming=this.meaningfulActions(b.actions);
+    const stored=this.get("session:pending",[]), meaningful=[...stored,...incoming].slice(-50);
+    if(!meaningful.length)return j({ok:true,empty:true,pending:0});
     const packet=this.compactActivity(meaningful);
+    const bridge=await this.pushBridge("session_activity",packet,{actor:"user",source:"companion",origin:"companion_ui"});
+    if(!bridge.ok)return j({ok:false,error:bridge.error||"Uranus Bridge push failed",bridge},502);
     this.put("pending:user",[...this.get("pending:user",[]),...meaningful].slice(-30));
-    await this.pushBridge("session_activity",packet,{actor:"user",source:"companion",origin:"companion_ui"});
-    return j({ok:true,actions:meaningful.length});
+    this.put("session:pending",[]); this.put("session:deadline",null);
+    return j({ok:true,actions:meaningful.length,bridge});
   }
   compactActivity(actions){
     return actions.slice(-20).map(a=>{
@@ -241,9 +257,31 @@ export class Companion extends DurableObject {
     }
     return outcome;
   }
-  async pushBridge(type,text,meta={}){ const s=this.settings(),b=s.bridge; if(!b.enabled||!b.url||!text)return; try{ await fetch(b.url,{method:"POST",headers:{"content-type":"application/json","x-uranus-key":b.key||""},body:JSON.stringify({type,text,characterName:s.characterName,userName:s.userName,maxContextChars:b.maxContextChars,actor:meta.actor||((type==="character_summary"||type==="character_life")?"character":"user"),source:meta.source||"companion",origin:meta.origin||((type==="character_summary")?"companion_agent":"companion_ui"),createdAt:nowIso()})}); }catch{} }
-  async arm(){ const s=this.settings(); if(!s.autonomy.enabled||s.autonomy.maxVisits===0){ await this.ctx.storage.deleteAlarm(); return; } const min=Math.max(10,s.autonomy.minIntervalMinutes)*60000; await this.ctx.storage.setAlarm(Date.now()+min); }
-  async alarm(){ const s=this.settings(); if(!s.autonomy.enabled||s.autonomy.maxVisits===0)return; const d=new Intl.DateTimeFormat("en-CA",{timeZone:s.timezone||this.env.TZ||"America/New_York",hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date()); const [h,m]=d.split(":").map(Number), cur=h*60+m, [sh,sm]=s.autonomy.activeStart.split(":").map(Number), [eh,em]=s.autonomy.activeEnd.split(":").map(Number); if(cur>=sh*60+sm&&cur<=eh*60+em){ const key=`visits:${new Intl.DateTimeFormat("en-CA",{timeZone:s.timezone||this.env.TZ||"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date())}`; const count=this.get(key,0); const target=this.get(`${key}:target`,null)??Math.floor(Math.random()*(s.autonomy.maxVisits-s.autonomy.minVisits+1))+s.autonomy.minVisits; this.put(`${key}:target`,target); if(count<target){ try{await this.applyAgent(await this.callAgent("autonomous"),"autonomous"); this.put(key,count+1);}catch{} } } const min=Math.max(10,s.autonomy.minIntervalMinutes)*60000; await this.ctx.storage.setAlarm(Date.now()+min+Math.floor(Math.random()*min)); }
+  bridgeUrl(raw){ try{ const u=new URL(String(raw||"").trim()); if(!u.pathname||u.pathname==="/")u.pathname="/api/companion/bridge"; return u.toString(); }catch{return String(raw||"").trim();} }
+  async pushBridge(type,text,meta={}){
+    const s=this.settings(),b=s.bridge;
+    if(!b.enabled)return {ok:false,error:"Uranus Bridge is disabled"};
+    if(!b.url)return {ok:false,error:"Bridge URL is missing"};
+    if(!text)return {ok:false,error:"Nothing to push"};
+    const url=this.bridgeUrl(b.url);
+    try{
+      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","x-uranus-key":b.key||""},body:JSON.stringify({type,text,characterName:s.characterName,userName:s.userName,maxContextChars:b.maxContextChars,actor:meta.actor||((type==="character_summary"||type==="character_life")?"character":"user"),source:meta.source||"companion",origin:meta.origin||((type==="character_summary")?"companion_agent":"companion_ui"),createdAt:nowIso()})});
+      const responseText=(await r.text()).slice(0,500);
+      if(!r.ok)return {ok:false,status:r.status,url,error:`Uranus returned HTTP ${r.status}${responseText?`: ${responseText}`:""}`};
+      return {ok:true,status:r.status,url,response:responseText};
+    }catch(e){return {ok:false,url,error:`Failed to reach Uranus: ${e?.message||e}`};}
+  }
+  async arm(){ const s=this.settings(),deadline=Number(this.get("session:deadline",0))||0; if(deadline>Date.now()){await this.ctx.storage.setAlarm(deadline);return;} if(!s.autonomy.enabled||s.autonomy.maxVisits===0){ await this.ctx.storage.deleteAlarm(); return; } const min=Math.max(10,s.autonomy.minIntervalMinutes)*60000; await this.ctx.storage.setAlarm(Date.now()+min); }
+  async alarm(){
+    const deadline=Number(this.get("session:deadline",0))||0;
+    if(deadline&&deadline<=Date.now()&&this.get("session:pending",[]).length){
+      const fakeReq=new Request("https://companion.local/api/session/commit",{method:"POST",headers:{"content-type":"application/json"},body:"{}"});
+      await this.commitSession(fakeReq);
+      if(this.get("session:pending",[]).length){await this.ctx.storage.setAlarm(Date.now()+60*1000);return;}
+    }
+    const s=this.settings(); if(!s.autonomy.enabled||s.autonomy.maxVisits===0){await this.arm();return;}
+    const d=new Intl.DateTimeFormat("en-CA",{timeZone:s.timezone||this.env.TZ||"America/New_York",hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date()); const [h,m]=d.split(":").map(Number), cur=h*60+m, [sh,sm]=s.autonomy.activeStart.split(":").map(Number), [eh,em]=s.autonomy.activeEnd.split(":").map(Number); if(cur>=sh*60+sm&&cur<=eh*60+em){ const key=`visits:${new Intl.DateTimeFormat("en-CA",{timeZone:s.timezone||this.env.TZ||"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date())}`; const count=this.get(key,0); const target=this.get(`${key}:target`,null)??Math.floor(Math.random()*(s.autonomy.maxVisits-s.autonomy.minVisits+1))+s.autonomy.minVisits; this.put(`${key}:target`,target); if(count<target){ try{await this.applyAgent(await this.callAgent("autonomous"),"autonomous"); this.put(key,count+1);}catch{} } } const min=Math.max(10,s.autonomy.minIntervalMinutes)*60000; await this.ctx.storage.setAlarm(Date.now()+min+Math.floor(Math.random()*min));
+  }
 }
 
 export default { async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
