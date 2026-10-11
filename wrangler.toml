@@ -1,4 +1,4 @@
-name = "uranus-companion"
+name = "rl7-uranus-companion"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 workers_dev = true

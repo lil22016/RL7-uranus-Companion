@@ -13,6 +13,6 @@
 <h3>Character instructions</h3><label class="wide">Persona<textarea id="persona"></textarea></label><label class="wide">User persona<textarea id="userPersona"></textarea></label><label class="wide">Worldbook<textarea id="worldbook"></textarea></label><label class="wide">Companion instructions<textarea id="instructions"></textarea></label>
 <h3>Model profiles</h3><div id="profiles" class="wide"></div><button type="button" id="addProfile" class="wide secondary">+ Add model profile</button><label class="wide">Active model<select id="activeProfile"></select></label>
 <h3>Uranus bridge</h3><label class="toggle">Enabled<input id="bridgeEnabled" type="checkbox"></label><label class="wide">Bridge URL<input id="bridgeUrl" placeholder="leave blank for now"></label><label class="wide">Bridge key<input id="bridgeKey" type="password"></label>
-<button type="button" id="saveSettings" class="primary wide">Save settings</button></div></form></dialog>
+<button type="button" id="saveSettings" class="primary wide">Save settings</button><button type="button" class="secondary wide" onclick="document.getElementById('settings').close()">Done</button></div></form></dialog>
 <dialog id="edit"><form method="dialog"><div class="modalHead"><h2 id="editTitle">Add</h2><button>Cancel</button></div><div id="editBody" class="settingsGrid"></div><button type="button" id="editSave" class="primary">Save</button></form></dialog>
 <div id="toast"></div><script src="/app.js"></script></body></html>
