@@ -88,7 +88,7 @@ export class Companion extends DurableObject {
     if(!x.text)return j({ok:false,error:"Comment required"},400);this.add("comments",x);return j({ok:true,item:x}); }
   async createReaction(req){ const b=await this.body(req),lib=this.settings().reactionLibrary,target=this.target(b.targetType,b.targetId);
     if(!target||target.owner!=="character")return j({ok:false,error:"You can only react to the character's entries"},403);
-    if(!lib.includes(b.emoji))return j({ok:false,error:"Reaction not in library"},400);
+    if(!String(b.emoji||"").trim()||String(b.emoji).length>80)return j({ok:false,error:"Enter a reaction (up to 80 characters)"},400);
     let arr=this.list("reactions").filter(x=>!(x.actor==="user"&&x.targetType===b.targetType&&x.targetId===b.targetId));
     const x={id:id("r"),actor:"user",targetType:b.targetType,targetId:b.targetId,emoji:b.emoji,createdAt:nowIso()};
     arr.push(x);this.save("reactions",arr);return j({ok:true,item:x}); }
@@ -109,6 +109,14 @@ export class Companion extends DurableObject {
       const outcome=await this.applyAgent(result,mode,b.date);
       if(mode==="write_schedule"&&outcome.schedule===0)throw new Error("Model returned no schedule entry. Nothing was saved; please try again.");
       if(mode==="write_diary"&&outcome.diary===0)throw new Error("Model returned no diary entry. Nothing was saved; please try again.");
+      if(mode==="look_schedule"||mode==="look_diary"){
+        const subject=mode==="look_diary"?"diary":"schedule";
+        const details=[];
+        if(outcome.reactions)details.push(`reacted to ${outcome.reactions} ${outcome.reactions===1?"entry":"entries"}`);
+        if(outcome.comments)details.push(`commented on ${outcome.comments} ${outcome.comments===1?"entry":"entries"}`);
+        const receipt=`${this.settings().characterName} looked at your ${subject}. ${details.length?details.join(" and ")+".":"No reaction or comment."}`;
+        this.add("notifications",{id:id("n"),text:receipt,read:false,createdAt:nowIso()});
+      }
       return j({ok:true,result,applied:outcome});
     }catch(e){return j({ok:false,error:e.message||String(e)},400);}
   }
