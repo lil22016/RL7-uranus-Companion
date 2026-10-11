@@ -37,3 +37,11 @@ body.settings-mode .app{display:none!important}
   -webkit-backdrop-filter:none;
 }
 @media(max-width:560px){#settingsPage .settingsSurface{padding:0}}
+
+
+/* Session push preview */
+.sessionPreview{margin-top:12px;padding:13px 14px;border:1px solid rgba(255,255,255,.14);border-radius:16px;background:rgba(255,255,255,.055)}
+.sessionPreviewHead{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px}
+.sessionPreviewHead span{font-size:12px;opacity:.62;white-space:nowrap}
+.sessionPreviewState{margin-top:7px;font-size:12px;opacity:.62;line-height:1.4}
+.sessionPreview pre{margin:10px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;max-height:220px;overflow:auto;color:inherit}

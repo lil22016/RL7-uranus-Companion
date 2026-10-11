@@ -40,6 +40,7 @@ export class Companion extends DurableObject {
     if(p==="/api/highlight"&&m==="POST") return this.createHighlight(req);
     if(p==="/api/agent/run"&&m==="POST") return this.agentRun(req);
     if(p==="/api/session/touch"&&m==="POST") return this.touchSession(req);
+    if(p==="/api/session/preview"&&m==="GET") return this.previewSession();
     if(p==="/api/session/commit"&&m==="POST") return this.commitSession(req);
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
@@ -124,6 +125,21 @@ export class Companion extends DurableObject {
     this.put("session:deadline",deadline);
     await this.ctx.storage.setAlarm(deadline);
     return j({ok:true,queued:stamped.length,pending:pending.length,deadline:new Date(deadline).toISOString()});
+  }
+  previewSession(){
+    const pending=this.get("session:pending",[]);
+    const delivery=this.get("session:delivery",null);
+    const deadline=Number(this.get("session:deadline",0))||0;
+    const summary=pending.length?this.compactActivity(pending):"";
+    return j({
+      ok:true,
+      pending:pending.length,
+      summary,
+      retrying:Boolean(delivery),
+      packetId:delivery?.packetId||null,
+      retryActions:Array.isArray(delivery?.actions)?delivery.actions.length:0,
+      deadline:deadline?new Date(deadline).toISOString():null
+    });
   }
   async commitSession(req){
     const b=await this.body(req), incoming=this.meaningfulActions(b.actions).map(x=>({...x,eventId:String(x.eventId||crypto.randomUUID()),eventCreatedAt:String(x.eventCreatedAt||nowIso())}));
