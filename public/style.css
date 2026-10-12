@@ -52,3 +52,9 @@ body.settings-mode .app{display:none!important}
 @media(max-width:560px){.sessionActionRow{grid-template-columns:1fr}}
 
 .pushSimplifiedRow{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:10px}.pushSimplifiedRow #editSimplifyPrompt{white-space:nowrap}@media(max-width:560px){.pushSimplifiedRow{grid-template-columns:1fr 1fr}}
+
+/* Patch — nested comment threads */
+.comment{margin-top:7px}.comment .comment{margin-left:16px;padding-left:10px;border-left:1px solid rgba(255,255,255,.18)}
+.commentTools{display:inline-flex;gap:5px;margin-left:8px}.commentTools .pill{font-size:10px;padding:3px 7px;opacity:.72}
+
+.entryImages{display:flex;gap:9px;overflow-x:auto;margin-top:10px}.entryImageWrap{min-width:145px;max-width:230px}.entryImageWrap img{width:100%;max-height:220px;object-fit:cover;border-radius:14px;display:block}.entryImageWrap small{display:block;font-size:11px;opacity:.6;margin-top:4px}.imageButtons{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.filePill{cursor:pointer}.completedOriginal>.row .text>div:first-child,.completedOriginal>.row .time{text-decoration:line-through;opacity:.48}.completionEvent{margin-top:8px;border-left:2px solid rgba(255,255,255,.22);padding-left:10px}.completionEvent .status{text-transform:uppercase;letter-spacing:.08em}
