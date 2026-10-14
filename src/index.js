@@ -60,6 +60,7 @@ export class Companion extends DurableObject {
     if(p.startsWith("/api/suggestion/")&&p.endsWith("/reject")&&m==="POST") return this.rejectSuggestion(p.split("/")[3]);
     if(p==="/api/font"&&m==="POST") return this.storeFont(req);
     if(p==="/api/font/link"&&m==="POST") return this.storeFontLink(req);
+    if(p==="/api/uranus/providers"&&m==="GET"){ try{const c=await this.uranus("/api/config"); return j({ok:true,providers:(c.providers||[]).map(x=>({id:x.id,name:x.name,type:x.type||"custom",models:(x.models||[]).map(mm=>({model:mm.model,alias:mm.alias||"",category:mm.category||""}))}))}); }catch(e){ return j({ok:false,error:String(e.message||e)},400); } }
     if(p==="/api/music/state"&&m==="GET") return this.musicState();
     if(p==="/api/music/cfg"&&m==="PUT") return this.musicCfgSave(req);
     if(p==="/api/music/attitude"&&m==="POST") return this.musicAttitude(req);
@@ -224,7 +225,7 @@ export class Companion extends DurableObject {
     }
     throw new Error("Unknown tool: "+name);
   }
-  async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; const got=req.headers.get("x-companion-key")||""; return got===secret; }
+  async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; let got=req.headers.get("x-companion-key")||""; if(!got&&req.method==="GET"){const u=new URL(req.url); if(u.pathname.startsWith("/api/image/")||u.pathname.startsWith("/api/font/"))got=u.searchParams.get("k")||"";} return got===secret; }
   async body(req){ try{return await req.json();}catch{return{};} }
   async freshStart(){
     // One-time schema-aware cleanup: remove life/history/test data only. Settings are intentionally preserved.
