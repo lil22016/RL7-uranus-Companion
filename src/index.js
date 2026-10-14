@@ -33,6 +33,7 @@ export class Companion extends DurableObject {
     if(p==="/garden/ingest"&&(m==="POST"||m==="OPTIONS")) return this.gardenIngest(req,u);
     if(p==="/mcp") return this.mcpRoute(req,u);
     if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
+    if(p==="/api/bootstrap"&&m==="GET"){ try{this.tidyActivities();}catch{} }
     if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse(),organizer:this.get("org:state",null),suggestions:this.list("suggestions"),fonts:this.list("fonts")});
     if(p==="/api/settings"&&m==="PUT") return this.setSettings(req);
     if(p==="/api/garden/info"&&m==="GET") return j({ok:true,token:String(this.settings().garden?.token||""),url:u.origin});
@@ -85,6 +86,7 @@ export class Companion extends DurableObject {
     if(same){let d=0;for(let i=0;i<tok.length;i++)d|=tok.charCodeAt(i)^got.charCodeAt(i);same=d===0;}
     const out=(o,status=200)=>new Response(JSON.stringify(o),{status,headers:{...cors,"content-type":"application/json; charset=utf-8"}});
     if(!same)return out({ok:false,error:"Bad Garden token"},401);
+    try{this.tidyActivities();}catch{}
     const today=this.localDate(),from=this.isoPlus(today,-30),to=this.isoPlus(today,120);
     const items=this.list("schedule").filter(x=>x.owner==="character"&&x.date&&x.date>=from&&x.date<=to).sort((a,b)=>String(a.date).localeCompare(String(b.date))||String(a.time||"99:99").localeCompare(String(b.time||"99:99"))).slice(-500).map(x=>{
       const st=["planned","done","failed","changed","cancelled"].includes(x.status)?x.status:"planned";
@@ -93,6 +95,23 @@ export class Companion extends DurableObject {
     return out({ok:true,characterName:this.settings().characterName||"Loki",tz:this.tzName(),now:nowIso(),items});
   }
 
+  /* Long text in the title slot -> short title + description (nothing is lost: the full text moves to desc). */
+  splitText(text,desc=""){
+    text=String(text||"").trim();desc=String(desc||"").trim();
+    if(text.length<=40)return {title:text,desc:desc.slice(0,2000)};
+    const head=text.slice(0,40);let cut=-1;
+    for(let k=head.length-1;k>=4;k--){if(/[。！？!?；;\n]/.test(head[k])){cut=k;break;}}
+    if(cut<0){for(let k=Math.min(head.length-1,36);k>=8;k--){if(/[，,、]/.test(head[k])){cut=k;break;}}}
+    let title=cut>0?text.slice(0,cut).trim():text.slice(0,32).trim()+"…";
+    if(title.length>60)title=title.slice(0,56).trim()+"…";
+    return {title,desc:(text+(desc&&desc!==text?"\n"+desc:"")).slice(0,2000)};
+  }
+  tidyActivities(){
+    const arr=this.list("schedule");let n=0;
+    for(const x of arr){if(x.owner==="character"&&!x.tidied&&String(x.text||"").length>40){const sp=this.splitText(x.text,x.desc);x.text=sp.title;x.desc=sp.desc;x.tidied=true;n++;}}
+    if(n)this.save("schedule",arr);
+    return n;
+  }
   tokOk(tok,got){ tok=String(tok||"");got=String(got||""); if(!tok||tok.length!==got.length)return false; let d=0; for(let i=0;i<tok.length;i++)d|=tok.charCodeAt(i)^got.charCodeAt(i); return d===0; }
   /* Garden → Companion: a read-only snapshot of the user's own DDL tasks, so Loki can see them (never written back). */
   async gardenIngest(req,u){
@@ -166,7 +185,7 @@ export class Companion extends DurableObject {
       const date=isoD(a.date);
       const dup=this.list("schedule").find(x=>x.owner==="character"&&(x.status||"planned")==="planned"&&(x.date||"")===date&&this.normTitle(x.text)===this.normTitle(title));
       if(dup)return {ok:true,duplicate:true,item:slim(dup),note:"An identical planned activity already exists; nothing was added."};
-      const x=this.newActivity({owner:"character",date,time:a.time,end:a.end,text:title,desc:a.desc});
+      const sp=this.splitText(title,a.desc);const x=this.newActivity({owner:"character",date,time:a.time,end:a.end,text:sp.title,desc:sp.desc});
       Object.assign(x,{origin:"uranus_mcp",orgKey:`${date}|${this.normTitle(title)}`,recordedAt:nowIso(),tz:this.tzName()});
       this.add("schedule",x);
       return {ok:true,item:slim(x)};
@@ -493,7 +512,7 @@ export class Companion extends DurableObject {
     const mode=["look_schedule","write_schedule","look_diary","write_diary","review_status","autonomous"].includes(b.mode)?b.mode:"autonomous";
     try{
       const result=await this.callAgent(mode,b.date);
-      if(mode==="write_schedule"&&!(Array.isArray(result.schedule)&&result.schedule.some(x=>String(x.text||"").trim())))throw new Error("Model returned no schedule entry. Nothing was saved; please try again.");
+      if(mode==="write_schedule"&&!(Array.isArray(result.schedule)&&result.schedule.some(x=>String(x.title||x.text||"").trim())))throw new Error("Model returned no schedule entry. Nothing was saved; please try again.");
       if(mode==="write_diary"&&!String(result.diary?.text||"").trim())throw new Error("Model returned no diary entry. Nothing was saved; please try again.");
       if((mode==="look_schedule"||mode==="look_diary")&&!(Array.isArray(result.comments)&&result.comments.length)&&!(Array.isArray(result.reactions)&&result.reactions.length))throw new Error("Loki looked, but returned no reaction or comment. Please try again.");
       const outcome=await this.applyAgent(result,mode,b.date);
@@ -525,7 +544,7 @@ export class Companion extends DurableObject {
     const instruction=mode==="review_status"?`STATUS REVIEW ONLY. Do NOT create schedule or diary entries and do NOT comment or react. Only review YOUR schedule. ${statusRule}`:mode==="write_schedule"?`MANDATORY: Create at least ONE nonempty schedule item in the schedule array for ${date}. You are writing YOUR OWN lived day, not merely looking. Do not invent content just to fill the calendar. ${todayWriteRule}`:mode==="write_diary"?`MANDATORY: Write a nonempty diary object {"date":"${date}","text":"..."}. Write YOUR OWN diary, even if it is just 1-2 natural sentences. Do not return null diary. ${todayWriteRule}`:mode==="look_schedule"?`LOOK ONLY at the user's schedule. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on a USER schedule entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every schedule interaction, targetType MUST be "schedule" and targetId MUST be an exact schedule id shown in ELIGIBLE TARGETS. Never return with both comments and reactions empty.`:mode==="look_diary"?`LOOK ONLY at the user's diary. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on the USER diary entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every diary interaction, targetType MUST be "diary" and targetId MUST be the exact diary id shown in ELIGIBLE TARGETS. Never use "schedule" for a diary interaction. Never return with both comments and reactions empty.`:`AUTONOMOUS VISIT. Prefer living YOUR OWN life rather than hovering over the user. Across visits, balance three categories roughly evenly: (A) write/update YOUR schedule, (B) write YOUR diary when no diary exists today, (C) interact with the USER. Do not repeatedly choose C just because user activity exists. At most ONE comment/reply per target or user comment in a visit. Never leave a second character reply under the same user comment. If replying to a user comment, use targetType "comment" and its exact comment id. Do not pile multiple standalone comments onto the same user entry. It is fine to write only your own life and not react to the user. ${statusRule}`;
     const langRule=String(s.agent.language||"").trim()?`OUTPUT LANGUAGE (HIGHEST PRIORITY): write EVERY human-readable text value you produce (diary text, schedule titles, comments, summaries) in ${String(s.agent.language).trim()}. This overrides the language of the persona, worldbook, URANUS MEMORY, existing entries and the user's messages. Never switch to another language.`:"";
     const prompt=`${langRule?langRule+"\n":""}You are ${s.characterName}. Return ONLY valid JSON.\nMODE: ${mode}\nTARGET DATE: ${date}\nLOCAL TIMEZONE: ${s.timezone}\nCURRENT UTC: ${nowIso()}\nIMPORTANT INSTRUCTION: ${instruction}\nYou can change the status of YOUR OWN existing schedules using updates [{"id":"existing id","status":"done|failed|cancelled|changed","actualText":"required only for changed"}]. Do not edit or delete original schedule text.\nYou can ONLY comment/react to the USER's existing entries. Never comment/react to your own.\nPERSONA:\n${s.agent.persona}\nUSER:\n${s.agent.userPersona}\nWORLDBOOK:\n${s.agent.worldbook}\nSPECIAL INSTRUCTIONS:\n${s.agent.instructions}\nAVAILABLE REACTIONS: ${s.reactionLibrary.join(" ")}\nELIGIBLE TARGETS FOR THIS REQUEST:\n${mode==="look_diary"?JSON.stringify(userDiaryForDate):mode==="look_schedule"?JSON.stringify(userScheduleForDate):"n/a"}\nINTERACTION JSON SCHEMA: comments use {"targetType":"schedule|diary|comment","targetId":"exact existing entry/comment id","text":"..."}. targetType "comment" means reply to an existing USER comment; reactions use {"targetType":"schedule|diary","targetId":"exact existing id","emoji":"one AVAILABLE REACTION"}.\n${uctx}\nRECENT USER ACTIVITY:\n${this.compactActivity(pending)}\nEXISTING COMMENT THREADS (do not duplicate a character reply to the same user comment):\n${JSON.stringify(this.list("comments").slice(-40))}\nYOUR SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="character").slice(-30))}\nUSER SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="user").slice(-30))}\nYOUR DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="character").slice(-7))}\nUSER DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="user").slice(-7))}\nOPTIONAL IMAGE: for YOUR OWN schedule/diary only, when an image would naturally enrich the entry and Image Generation is enabled, add "imagePrompt":"short visual prompt" to that schedule item or diary object. Do not create images for user entries.
-Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reactions":[],"summary":{"diary":"","schedule":[]},"messageNow":null}. schedule items use {"date":"${date}","time":"HH:MM or empty","end":"HH:MM or empty","text":"..."}. Comments/reactions must target existing USER entry IDs only.`;
+Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reactions":[],"summary":{"diary":"","schedule":[]},"messageNow":null}. schedule items use {"date":"${date}","time":"HH:MM or empty","end":"HH:MM or empty","title":"a SHORT summary, at most 30 characters, a label not a sentence","desc":"the details / what actually happens, one or two sentences (optional)"}. NEVER put the whole description into "title". Comments/reactions must target existing USER entry IDs only.`;
     const base=String(profile.baseUrl||"").replace(/\/$/,"");const path=profile.path||"/chat/completions";
     const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:(mode.startsWith("write_")?`Write the required ${mode==="write_schedule"?"schedule":"diary"} for ${date} now. Return a nonempty result.`:mode.startsWith("look_")?`Look at the requested user content now and MUST leave at least one valid reaction or comment on it.`:mode==="review_status"?"Review the status of your own past plans now.":"Decide what you naturally do this visit.")+(langRule?` (Reminder: all text values must be in ${String(s.agent.language).trim()}.)`:"")}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)}),response_format:{type:"json_object"}})});
     const txt=await r.text();if(!r.ok)throw new Error(`Model ${r.status}: ${txt.slice(0,300)}`);
@@ -543,14 +562,16 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
       const localNow=this.localNow();
       if(dateNow>localNow.date)throw new Error("Refusing to save invented future schedule entries.");
       for(const x of (Array.isArray(o.schedule)?o.schedule:[]).slice(0,10)){
-        if(!String(x.text||"").trim())continue;
+        const rawTitle=String(x.title||x.text||"").trim();
+        if(!rawTitle)continue;
+        const sp=this.splitText(rawTitle,x.desc);
         const start=String(x.time||"").slice(0,5),end=String(x.end||"").slice(0,5);
         if(dateNow===localNow.date){
           if(!/^\d{2}:\d{2}$/.test(start))continue;
           if(start>localNow.time)continue;
           if(end&&(/^\d{2}:\d{2}$/.test(end)?end>localNow.time:true))continue;
         }
-        const images=await this.maybeAgentImage(x.imagePrompt),item={id:id("s"),owner:"character",date:dateNow,time:start,end,text:String(x.text).trim().slice(0,1000),status:"planned",images,history:[],createdAt:nowIso(),updatedAt:nowIso()};
+        const images=await this.maybeAgentImage(x.imagePrompt),item={id:id("s"),owner:"character",date:dateNow,time:start,end,text:sp.title,desc:sp.desc,status:"planned",images,history:[],createdAt:nowIso(),updatedAt:nowIso()};
         this.add("schedule",item);outcome.schedule++;this.queueCharacter(`${this.settings().characterName} added to their schedule: ${item.text}${this.imageContext(item)}`);
       }
     }
