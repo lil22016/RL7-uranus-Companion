@@ -12,6 +12,7 @@ const DEFAULTS = {
   modelProfiles:[],
   bridge:{enabled:false,url:"",key:"",immediateReaction:"decide",maxContextChars:2800},
   image:{enabled:false,baseUrl:"",apiKey:"",model:"",positivePrompt:""},
+  appearance:{my:{},loki:{},css:""},
   simplifyPrompt:"You compress a Companion activity session for another AI that already knows the user and character. Minimize tokens aggressively WITHOUT losing meaningful information or temporal context.\n\nRULES:\n1. Preserve ALL meaningful facts, outcomes, status changes, emotions, relationship cues, jokes, requests, promises, concerns, and user intent. Compression must not make meaningful information disappear merely because it seems casual.\n2. Preserve TIME CONTEXT. Each source event includes its local date/time. Keep exact or concise time references whenever timing affects meaning, chronology, behavior, or how the receiving character may respond (for example: staying up late, waking early, deadlines, meals, appointments, travel, or something happening unusually late/early). For multiple events close together, you may state one shared time/range instead of repeating timestamps. Do not drop a time merely to save tokens when it changes the meaning.\n3. Merge duplicate lifecycle events about the same item (created/planned/updated/done/etc.) into one concise statement reflecting the final state while retaining meaningful changes.\n4. Merge reactions and comments aimed at the same character entry when natural.\n5. Short source wording that is already efficient may be kept verbatim, especially distinctive emotional/relationship language. Long wording may be paraphrased, but ALL meaningful semantic content must still be conveyed.\n6. Preserve short direct quotes when exact wording, humor, affection, teasing, or tone matters. Do not preserve long wording merely for style.\n7. Never invent, infer, embellish, correct, moralize, or add facts. Do not change actor, target, chronology, time, completion status, or intent.\n8. Do not summarize away details that could change how the receiving character understands or responds.\n9. Remove mechanical repetition, UI wording, redundant target text, and duplicated descriptions.\n10. Use compact plain text, usually one line per distinct semantic event. No headings, analysis, JSON, or explanatory preamble.\n11. Aim for the fewest tokens possible AFTER satisfying all preservation rules. Accuracy, semantic completeness, and relevant temporal context outrank brevity.\n\nReturn ONLY the compressed session text."
 };
 
@@ -28,7 +29,7 @@ export class Companion extends DurableObject {
     const u=new URL(req.url), p=u.pathname, m=req.method;
     if(p==="/api/health") return j({ok:true});
     if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
-    if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse()});
+    if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse(),suggestions:this.list("suggestions"),fonts:this.list("fonts")});
     if(p==="/api/settings"&&m==="PUT") return this.setSettings(req);
     if(p==="/api/image"&&m==="POST") return this.storeImage(req);
     if(p.startsWith("/api/image/")&&m==="GET") return this.readImage(p.split("/").pop());
@@ -40,6 +41,13 @@ export class Companion extends DurableObject {
     if(p==="/api/schedule"&&m==="POST") return this.createSchedule(req);
     if(p.startsWith("/api/schedule/")&&m==="PATCH") return this.patch("schedule",p.split("/").pop(),req);
     if(p.startsWith("/api/schedule/")&&m==="DELETE") return this.remove("schedule",p.split("/").pop());
+    if(p.startsWith("/api/schedule/")&&p.endsWith("/change")&&m==="POST") return this.changeSchedule(p.split("/")[3],req);
+    if(p==="/api/suggest/run"&&m==="POST") return this.suggestRun(req);
+    if(p.startsWith("/api/suggestion/")&&p.endsWith("/accept")&&m==="POST") return this.acceptSuggestion(p.split("/")[3]);
+    if(p.startsWith("/api/suggestion/")&&p.endsWith("/reject")&&m==="POST") return this.rejectSuggestion(p.split("/")[3]);
+    if(p==="/api/font"&&m==="POST") return this.storeFont(req);
+    if(p.startsWith("/api/font/")&&m==="GET") return this.readFont(p.split("/").pop());
+    if(p.startsWith("/api/font/")&&m==="DELETE") return this.deleteFont(p.split("/").pop());
     if(p==="/api/diary"&&m==="POST") return this.createDiary(req);
     if(p.startsWith("/api/diary/")&&m==="PATCH") return this.patch("diary",p.split("/").pop(),req);
     if(p.startsWith("/api/diary/")&&m==="DELETE") return this.remove("diary",p.split("/").pop());
@@ -57,12 +65,12 @@ export class Companion extends DurableObject {
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
   }
-  async auth(req){ return true; }
+  async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; const got=req.headers.get("x-companion-key")||""; return got===secret; }
   async body(req){ try{return await req.json();}catch{return{};} }
   async freshStart(){
     // One-time schema-aware cleanup: remove life/history/test data only. Settings are intentionally preserved.
     const cleared={};
-    for(const kind of ["schedule","diary","comments","reactions","highlights","notifications"]){
+    for(const kind of ["schedule","diary","comments","reactions","highlights","notifications","suggestions"]){
       cleared[kind]=this.list(kind).length;
       this.save(kind,[]);
     }
@@ -85,35 +93,75 @@ export class Companion extends DurableObject {
   async flushCharacterContext(reason="scheduled"){const q=this.get("pending:character",[]);if(!q.length)return j({ok:true,empty:true});const packet=q.map(x=>`[${this.formatSessionTime(x.createdAt)}] ${x.text}`).join("\n"),packetId=crypto.randomUUID();this.add("notifications",{id:id("n"),text:"Character context syncing to Uranus…",read:false,createdAt:nowIso(),activityDate:this.localDate()});const r=await this.pushBridge("character_life",packet,{actor:"character",source:"companion",origin:`character_context_${reason}`,packetId});if(r.ok&&r.accepted){this.put("pending:character",[]);this.add("notifications",{id:id("n"),text:`Character context synced to Uranus · ${reason}.`,read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:true,accepted:true})}this.add("notifications",{id:id("n"),text:"Character context sync failed · retained for retry.",read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:false,error:r.error||"No ACK"},502)}
   pruneActivity(){const tz=this.settings().timezone||this.env.TZ||"America/New_York",fmt=d=>new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d),t=fmt(new Date()),y=new Date();y.setDate(y.getDate()-1);const keep=new Set([t,fmt(y)]);this.save("notifications",this.list("notifications").filter(n=>keep.has(n.activityDate||fmt(new Date(n.createdAt)))))}
   async setSettings(req){ const b=await this.body(req); const old=this.settings(); const a=b.autonomy||{}; const next={...old,...b,autonomy:{...old.autonomy,...a,minVisits:clamp(a.minVisits??old.autonomy.minVisits,0,10),maxVisits:clamp(a.maxVisits??old.autonomy.maxVisits,0,10),minIntervalMinutes:clamp(a.minIntervalMinutes??old.autonomy.minIntervalMinutes,0,1440)},reactionLibrary:[...new Set((b.reactionLibrary??old.reactionLibrary).map(String))].slice(0,50)}; if(next.autonomy.maxVisits<next.autonomy.minVisits)next.autonomy.maxVisits=next.autonomy.minVisits; this.put("settings",next); await this.arm(); return j({ok:true,settings:next}); }
+  newActivity(o){ const t=v=>/^\d{2}:\d{2}$/.test(String(v||"").slice(0,5))?String(v).slice(0,5):"",d=v=>/^\d{4}-\d{2}-\d{2}$/.test(String(v||"").slice(0,10))?String(v).slice(0,10):""; const time=t(o.time),end=time?t(o.end):""; return {id:id("s"),owner:o.owner||"user",date:d(o.date),time,end,deadline:!!(o.deadline&&time&&!end),text:String(o.text||"").trim().slice(0,1000),desc:String(o.desc||"").trim().slice(0,2000),status:["planned","done","failed"].includes(o.status)?o.status:"planned",images:Array.isArray(o.images)?o.images.slice(0,4):[],statusImages:[],history:[],changedFrom:o.changedFrom||null,changedTo:null,suggestionId:o.suggestionId||null,suggestedBy:o.suggestedBy||null,createdAt:nowIso(),updatedAt:nowIso()}; }
+  async createSchedule(req){ const b=await this.body(req); const text=String(b.text||"").trim(); if(!text)return j({ok:false,error:"Title required"},400); const x=this.newActivity({owner:"user",date:b.date,time:b.time,end:b.end,deadline:b.deadline,text,desc:b.desc,images:b.images}); this.add("schedule",x); return j({ok:true,item:x}); }
+  makeChange(x,spec,by="user"){
+    const rep=this.newActivity({owner:x.owner,date:spec.date!==undefined?spec.date:x.date,time:spec.time,end:spec.end,deadline:spec.deadline,text:spec.text,desc:spec.desc,images:spec.images,status:spec.status==="done"?"done":"planned",changedFrom:x.id,suggestionId:spec.suggestionId,suggestedBy:spec.suggestedBy});
+    if(rep.status==="done"){rep.statusChangedAt=nowIso();rep.statusBy=by;}
+    this.add("schedule",rep);
+    const orig=this.update("schedule",x.id,{status:"changed",changedTo:rep.id,statusChangedAt:nowIso(),statusBy:by,suggestionId:spec.suggestionId||x.suggestionId||null});
+    return {original:orig,replacement:rep};
+  }
+  async changeSchedule(itemId,req){
+    const b=await this.body(req),x=this.list("schedule").find(z=>z.id===itemId);
+    if(!x)return j({ok:false,error:"Not found"},404);
+    if(x.owner!=="user")return j({ok:false,error:"You can only change your own plans"},403);
+    if(x.status==="changed"&&x.changedTo)return j({ok:false,error:"This plan was already changed. Change the new plan instead."},409);
+    if(!String(b.text||"").trim())return j({ok:false,error:"Title required"},400);
+    return j({ok:true,...this.makeChange(x,b,"user")});
+  }
   async patch(kind,itemId,req){
-    if(!["schedule","diary"].includes(kind))return j({ok:false,error:"Invalid kind"},400);
-    const old=this.list(kind).find(x=>x.id===itemId);
-    if(!old)return j({ok:false,error:"Entry not found"},404);
-    if(old.owner!=="user")return j({ok:false,error:"Only your own entries can be edited here"},403);
-    const b=await this.body(req),out={};
-    const allowed=kind==="schedule"?["date","time","end","text","title","description","status","actualText","doneText","images","statusImages"]:["text","images"];
-    for(const k of allowed)if(Object.prototype.hasOwnProperty.call(b,k)&&b[k]!==undefined){
-      if(["images","statusImages"].includes(k)){if(Array.isArray(b[k]))out[k]=b[k].slice(0,6)}
-      else out[k]=String(b[k]??"").slice(0,k==="description"?1500:10000);
-    }
+    const b=await this.body(req),x=this.list(kind).find(z=>z.id===itemId);
+    if(!x)return j({ok:false,error:"Not found"},404);
+    if(x.owner!=="user")return j({ok:false,error:"You can only edit your own entries"},403);
+    const patch={};
     if(kind==="schedule"){
-      if(out.status&&! ["planned","done","failed","changed","cancelled"].includes(out.status))return j({ok:false,error:"Invalid status"},400);
-      if(out.title!==undefined)out.text=out.title;
-      if(out.text!==undefined&&!out.text.trim())return j({ok:false,error:"Title required"},400);
-      if(out.status&&out.status!==old.status){out.statusChangedAt=nowIso();out.history=[...(old.history||[]),{status:old.status,at:nowIso()}].slice(-50)}
+      const t=v=>/^\d{2}:\d{2}$/.test(String(v||"").slice(0,5))?String(v).slice(0,5):"";
+      if(b.status==="changed"){
+        // legacy "Changed plan" from the original Companion page: becomes a real linked replacement
+        if(!String(b.actualText||"").trim())return j({ok:false,error:"Say what you did instead"},400);
+        if(x.status==="changed"&&x.changedTo)return j({ok:false,error:"This plan was already changed."},409);
+        return j({ok:true,item:this.makeChange(x,{text:b.actualText,status:"done"},"user").original});
+      }
+      if(x.status==="changed"&&x.changedTo&&("status" in b))return j({ok:false,error:"This plan was changed. Edit the new plan instead."},409);
+      if("text" in b){const v=String(b.text||"").trim();if(!v)return j({ok:false,error:"Title required"},400);patch.text=v.slice(0,1000);}
+      if("desc" in b)patch.desc=String(b.desc||"").trim().slice(0,2000);
+      if("date" in b)patch.date=/^\d{4}-\d{2}-\d{2}$/.test(String(b.date||"").slice(0,10))?String(b.date).slice(0,10):"";
+      if("time" in b||"end" in b||"deadline" in b){const time=t("time" in b?b.time:x.time),end=time?t("end" in b?b.end:x.end):"",dl=("deadline" in b)?b.deadline:x.deadline;patch.time=time;patch.end=end;patch.deadline=!!(dl&&time&&!end);}
+      if(Array.isArray(b.images))patch.images=b.images.slice(0,4);
+      if("status" in b){
+        if(!["planned","done","failed","cancelled"].includes(b.status))return j({ok:false,error:"Unknown status"},400);
+        patch.status=b.status;patch.statusChangedAt=nowIso();patch.statusBy="user";
+        if(b.status==="done"){if("doneText" in b)patch.doneText=String(b.doneText||"").trim().slice(0,1000);if(Array.isArray(b.statusImages))patch.statusImages=b.statusImages.slice(0,6);}
+      }
+    }else{
+      if("text" in b){const v=String(b.text||"").trim();if(!v)return j({ok:false,error:"Text required"},400);patch.text=v.slice(0,10000);}
+      if("title" in b)patch.title=String(b.title||"").trim().slice(0,200);
+      if(Array.isArray(b.images))patch.images=b.images.slice(0,6);
     }
-    return j({ok:true,item:this.update(kind,itemId,out)});
+    return j({ok:true,item:this.update(kind,itemId,patch)});
   }
   remove(kind,itemId){
-    if(!["schedule","diary"].includes(kind))return j({ok:false,error:"Invalid kind"},400);
-    const item=this.list(kind).find(x=>x.id===itemId);
-    if(!item)return j({ok:false,error:"Not found"},404);
-    if(item.owner!=="user")return j({ok:false,error:"Cannot delete character entries"},403);
-    this.save(kind,this.list(kind).filter(x=>x.id!==itemId));
+    const x=this.list(kind).find(z=>z.id===itemId);
+    if(!x)return j({ok:false,error:"Not found"},404);
+    if(x.owner!=="user")return j({ok:false,error:"You can only delete your own entries"},403);
+    this.save(kind,this.list(kind).filter(z=>z.id!==itemId));
+    if(kind==="schedule"){
+      // keep change chains consistent
+      if(x.changedFrom){const o=this.list("schedule").find(z=>z.id===x.changedFrom);if(o&&o.changedTo===x.id)this.update("schedule",o.id,{status:"planned",changedTo:null});}
+      if(x.changedTo){const r=this.list("schedule").find(z=>z.id===x.changedTo);if(r&&r.changedFrom===x.id)this.update("schedule",r.id,{changedFrom:null});}
+      this.save("suggestions",this.list("suggestions").filter(g=>g.targetId!==itemId));
+    }
+    this.save("comments",this.list("comments").filter(c=>!((c.rootId||c.targetId)===itemId)));
+    this.save("reactions",this.list("reactions").filter(r=>r.targetId!==itemId));
+    if(kind==="diary")this.save("highlights",this.list("highlights").filter(h=>h.diaryId!==itemId));
     return j({ok:true});
   }
-  async createSchedule(req){ const b=await this.body(req); const x={id:id("s"),owner:"user",date:String(b.date||"").slice(0,10),time:String(b.time||"").slice(0,5),end:String(b.end||"").slice(0,5),text:String(b.title||b.text||"").trim(),title:String(b.title||b.text||"").trim(),description:String(b.description||"").slice(0,1500),status:"planned",images:Array.isArray(b.images)?b.images.slice(0,4):[],history:[],createdAt:nowIso(),updatedAt:nowIso()}; if(!x.date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("schedule",x); return j({ok:true,item:x}); }
-  async createDiary(req){ const b=await this.body(req); const owner="user", date=String(b.date||"").slice(0,10); let arr=this.list("diary"); const existing=arr.find(x=>x.owner===owner&&x.date===date); if(existing){ const item=this.update("diary",existing.id,{text:String(b.text||"").trim(),...(Array.isArray(b.images)?{images:b.images.slice(0,6)}:{})}); return j({ok:true,item}); } const x={id:id("d"),owner,date,text:String(b.text||"").trim(),images:Array.isArray(b.images)?b.images.slice(0,6):[],createdAt:nowIso(),updatedAt:nowIso()}; if(!date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("diary",x); return j({ok:true,item:x}); }
+  async createDiary(req){ const b=await this.body(req); const owner="user", date=String(b.date||"").slice(0,10), text=String(b.text||"").trim(), images=Array.isArray(b.images)?b.images.slice(0,6):[], title=String(b.title||"").trim().slice(0,200);
+    if(!date||!text)return j({ok:false,error:"date and text required"},400);
+    if(b.id){ const x=this.list("diary").find(z=>z.id===b.id&&z.owner===owner); if(!x)return j({ok:false,error:"Entry not found"},404); return j({ok:true,item:this.update("diary",x.id,{text,title,images})}); }
+    if(!b.append){ const existing=this.list("diary").find(x=>x.owner===owner&&x.date===date); if(existing){ const item=this.update("diary",existing.id,{text,...(Array.isArray(b.images)?{images}:{})}); return j({ok:true,item}); } }
+    const x={id:id("d"),owner,date,title,kind:"diary",text,images,createdAt:nowIso(),updatedAt:nowIso()}; this.add("diary",x); return j({ok:true,item:x}); }
   target(type,targetId){
     if(type==="comment")return this.list("comments").find(x=>x.id===targetId)||null;
     if(!["schedule","diary"].includes(type))return null;
@@ -139,7 +187,7 @@ export class Companion extends DurableObject {
       return j({ok:false,error:"You can only comment on Loki's entries or reply to Loki's comments"},403);
     }
     const text=String(b.text||"").trim(); if(!text)return j({ok:false,error:"Comment required"},400);
-    const x={id:id("c"),actor:"user",targetType:rootType,targetId:rootId,rootType,rootId,parentId,text:text.slice(0,500),createdAt:nowIso(),updatedAt:nowIso()};
+    const x={id:id("c"),actor:"user",targetType:rootType,targetId:rootId,rootType,rootId,parentId,text:text.slice(0,500),quote:String(b.quote||"").slice(0,300),createdAt:nowIso(),updatedAt:nowIso()};
     this.add("comments",x);return j({ok:true,item:x});
   }
   async patchComment(commentId,req){
@@ -169,7 +217,7 @@ export class Companion extends DurableObject {
     if(!diary||diary.owner!=="character")return j({ok:false,error:"Only the character's diary can be highlighted"},403);
     const x={id:id("h"),actor:"user",diaryId:diary.id,text:String(b.text||""),start:Number(b.start)||0,end:Number(b.end)||0,createdAt:nowIso()};
     if(!x.text)return j({ok:false,error:"Text required"},400);this.add("highlights",x);return j({ok:true,item:x}); }
-  meaningfulActions(actions){ return (Array.isArray(actions)?actions:[]).filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule"].includes(x?.type)); }
+  meaningfulActions(actions){ return (Array.isArray(actions)?actions:[]).filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule","suggestion_accept","suggestion_reject"].includes(x?.type)); }
   async touchSession(req){
     const b=await this.body(req), meaningful=this.meaningfulActions(b.actions);
     if(!meaningful.length)return j({ok:true,empty:true,pending:this.get("session:pending",[]).length});
@@ -298,6 +346,8 @@ export class Companion extends DurableObject {
       if(a.type==="write_schedule")return `${t}Raylee added to My Day: ${String(a.summary||"").slice(0,220)}.`;
       if(a.type==="write_diary")return `${t}${String(a.summary||"").slice(0,700)}`;
       if(a.type==="update_schedule")return `${t}Raylee updated a plan: ${String(a.summary||"").slice(0,300)}.`;
+      if(a.type==="suggestion_accept")return `${t}Raylee accepted ${this.settings().characterName}'s suggestion for My Day: ${String(a.summary||"").slice(0,300)}.`;
+      if(a.type==="suggestion_reject")return `${t}Raylee rejected ${this.settings().characterName}'s suggestion for My Day (${String(a.summary||"").slice(0,300)}). Her original plan stays as it was.`;
       return `${t}${String(a.summary||a.type)}`;
     }).join("\n");
   }
@@ -375,7 +425,7 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
       const old=this.list("schedule").find(z=>z.id===x.id&&z.owner==="character");
       if(!old||!["planned","done","failed","cancelled","changed"].includes(x.status))continue;
       const actualText=String(x.actualText||"").trim();if(x.status==="changed"&&!actualText)continue;
-      this.update("schedule",old.id,{status:x.status,actualText:x.status==="changed"?actualText:"",statusChangedAt:nowIso()});outcome.updates++;this.queueCharacter(`${this.settings().characterName} updated schedule status: ${old.text} → ${x.status}${actualText?` (${actualText})`:""}`);
+      if(x.status==="changed")this.makeChange(old,{text:actualText,status:"done"},"character");else this.update("schedule",old.id,{status:x.status,statusChangedAt:nowIso(),statusBy:"character"});outcome.updates++;this.queueCharacter(`${this.settings().characterName} updated schedule status: ${old.text} → ${x.status}${actualText?` (${actualText})`:""}`);
     }
     if(writeDiary&&o.diary&&String(o.diary.text||"").trim()){
       const text=String(o.diary.text).trim().slice(0,10000);
@@ -423,6 +473,86 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
       if(summary.length)this.queueCharacter(summary.join(" | "));
     }
     return outcome;
+  }
+  async queueSession(actions){
+    const stamped=actions.map(x=>({...x,eventId:String(x.eventId||crypto.randomUUID()),eventCreatedAt:String(x.eventCreatedAt||nowIso())}));
+    const pending=[...this.get("session:pending",[]),...stamped].slice(-100);
+    this.put("session:pending",pending);
+    const deadline=Date.now()+5*60*1000;
+    this.put("session:deadline",deadline);
+    await this.ctx.storage.setAlarm(deadline);
+  }
+  async suggestRun(req){
+    const b=await this.body(req);
+    try{
+      const s=this.settings(),profile=s.modelProfiles.find(x=>x.id===s.agent.profileId);
+      if(!profile)throw new Error("Choose a model profile in Companion settings first.");
+      const date=/^\d{4}-\d{2}-\d{2}$/.test(b.date||"")?b.date:this.localDate();
+      const pendingTargets=new Set(this.list("suggestions").filter(g=>g.status==="pending").map(g=>g.targetId));
+      const items=this.list("schedule").filter(x=>x.owner==="user"&&x.date===date&&x.status==="planned"&&!pendingTargets.has(x.id));
+      if(!items.length)throw new Error("No open plans on My Day for this date.");
+      const brief=items.map(x=>({id:x.id,title:x.text,description:x.desc||"",time:x.time||"",end:x.end||""}));
+      const prompt=`You are ${s.characterName}. Return ONLY valid JSON.\nPERSONA:\n${s.agent.persona}\nUSER:\n${s.agent.userPersona}\nWORLDBOOK:\n${s.agent.worldbook}\nSPECIAL INSTRUCTIONS:\n${s.agent.instructions}\n\nTASK: ${s.userName} wrote these plans on her own My Day for ${date}. You may playfully meddle with AT MOST ONE or TWO of them by proposing a different plan she could do instead, in character. This is only a suggestion: she can accept or reject it. Do not suggest anything harmful or that would make her skip something important (classes, deadlines, work, medication). If nothing fits naturally, return an empty list.\nOPEN PLANS: ${JSON.stringify(brief)}\nReturn {"suggestions":[{"targetId":"exact id from OPEN PLANS","text":"short replacement title","desc":"optional one short line","time":"HH:MM or empty","end":"HH:MM or empty"}]}`;
+      const base=String(profile.baseUrl||"").replace(/\/$/,""),path=profile.path||"/chat/completions";
+      const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:"Decide now."}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)}),response_format:{type:"json_object"}})});
+      const txt=await r.text();if(!r.ok)throw new Error(`Model ${r.status}: ${txt.slice(0,300)}`);
+      let data;try{data=JSON.parse(txt);}catch{throw new Error("Model returned non-JSON response envelope");}
+      let o;try{o=JSON.parse(String(data.choices?.[0]?.message?.content??data.output_text??"").replace(/^```json\s*|\s*```$/g,""));}catch{throw new Error("Model did not return valid JSON");}
+      let made=0;
+      for(const z of (Array.isArray(o.suggestions)?o.suggestions:[]).slice(0,2)){
+        const target=items.find(x=>x.id===z.targetId);
+        if(!target||!String(z.text||"").trim())continue;
+        const t=v=>/^\d{2}:\d{2}$/.test(String(v||"").slice(0,5))?String(v).slice(0,5):"";
+        this.add("suggestions",{id:id("g"),targetId:target.id,targetText:target.text,actor:"character",date,text:String(z.text).trim().slice(0,300),desc:String(z.desc||"").trim().slice(0,600),time:t(z.time),end:t(z.time)?t(z.end):"",status:"pending",createdAt:nowIso(),updatedAt:nowIso()});made++;
+      }
+      if(!made)throw new Error(`${s.characterName} looked but had no suggestion this time.`);
+      this.add("notifications",{id:id("n"),text:`${s.characterName} suggested a change to ${made===1?"a plan":made+" plans"} on your day.`,read:false,createdAt:nowIso(),activityDate:this.localDate()});
+      return j({ok:true,made});
+    }catch(e){return j({ok:false,error:e.message||String(e)},400);}
+  }
+  async acceptSuggestion(sid){
+    const g=this.list("suggestions").find(x=>x.id===sid);
+    if(!g)return j({ok:false,error:"Suggestion not found"},404);
+    if(g.status!=="pending")return j({ok:false,error:"Already "+g.status},409);
+    const t=this.list("schedule").find(x=>x.id===g.targetId&&x.owner==="user");
+    if(!t)return j({ok:false,error:"The original plan is gone"},404);
+    if(t.status!=="planned")return j({ok:false,error:"The original plan is no longer open"},409);
+    const out=this.makeChange(t,{text:g.text,desc:g.desc,date:g.date||t.date,time:g.time,end:g.end,status:"planned",suggestionId:g.id,suggestedBy:"character"},"suggestion");
+    const sug=this.update("suggestions",g.id,{status:"accepted",resolvedAt:nowIso(),replacementId:out.replacement.id});
+    await this.queueSession([{type:"suggestion_accept",summary:`“${t.text}” → “${g.text}”`}]);
+    return j({ok:true,suggestion:sug,...out});
+  }
+  async rejectSuggestion(sid){
+    const g=this.list("suggestions").find(x=>x.id===sid);
+    if(!g)return j({ok:false,error:"Suggestion not found"},404);
+    if(g.status!=="pending")return j({ok:false,error:"Already "+g.status},409);
+    const sug=this.update("suggestions",g.id,{status:"rejected",resolvedAt:nowIso()});
+    await this.queueSession([{type:"suggestion_reject",summary:`“${g.text}” instead of “${g.targetText}”`}]);
+    return j({ok:true,suggestion:sug});
+  }
+  async storeFont(req){
+    const b=await this.body(req),ext=String(b.ext||"").toLowerCase().replace(/^\./,""),b64=String(b.b64||"");
+    if(!["woff2","woff","ttf","otf"].includes(ext))return j({ok:false,error:"Font must be .woff2, .woff, .ttf or .otf"},400);
+    if(!/^[A-Za-z0-9+/=]+$/.test(b64)||b64.length<100)return j({ok:false,error:"Font data required"},400);
+    if(b64.length>9000000)return j({ok:false,error:"Font file is too large (limit about 6.5 MB)"},413);
+    const fid=id("f"),chunks=[];for(let n=0;n<b64.length;n+=80000)chunks.push(b64.slice(n,n+80000));
+    chunks.forEach((x,n)=>this.put(`font:${fid}:${n}`,x));
+    const meta={id:fid,name:String(b.name||"Font").slice(0,80),ext,chunks:chunks.length,createdAt:nowIso()};
+    this.put(`font:${fid}:meta`,meta);this.add("fonts",meta);
+    return j({ok:true,font:meta});
+  }
+  readFont(fid){
+    const m=this.get(`font:${fid}:meta`,null);if(!m)return j({ok:false,error:"Font not found"},404);
+    let data="";for(let n=0;n<m.chunks;n++)data+=this.get(`font:${fid}:${n}`,"");
+    const bin=Uint8Array.from(atob(data),c=>c.charCodeAt(0));
+    const mime={woff2:"font/woff2",woff:"font/woff",ttf:"font/ttf",otf:"font/otf"}[m.ext]||"application/octet-stream";
+    return new Response(bin,{headers:{"content-type":mime,"cache-control":"private, max-age=31536000"}});
+  }
+  deleteFont(fid){
+    const m=this.get(`font:${fid}:meta`,null);
+    if(m){for(let n=0;n<m.chunks;n++)this.ctx.storage.kv.delete(`font:${fid}:${n}`);this.ctx.storage.kv.delete(`font:${fid}:meta`);}
+    this.save("fonts",this.list("fonts").filter(f=>f.id!==fid));
+    return j({ok:true});
   }
   bridgeUrl(raw){ try{ const u=new URL(String(raw||"").trim()); if(!u.pathname||u.pathname==="/")u.pathname="/api/companion/bridge"; return u.toString(); }catch{return String(raw||"").trim();} }
   async pushBridge(type,text,meta={}){
