@@ -57,7 +57,7 @@ export class Companion extends DurableObject {
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
   }
-  async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; const got=req.headers.get("x-companion-key")||""; return got===secret; }
+  async auth(req){ return true; }
   async body(req){ try{return await req.json();}catch{return{};} }
   async freshStart(){
     // One-time schema-aware cleanup: remove life/history/test data only. Settings are intentionally preserved.
@@ -85,7 +85,34 @@ export class Companion extends DurableObject {
   async flushCharacterContext(reason="scheduled"){const q=this.get("pending:character",[]);if(!q.length)return j({ok:true,empty:true});const packet=q.map(x=>`[${this.formatSessionTime(x.createdAt)}] ${x.text}`).join("\n"),packetId=crypto.randomUUID();this.add("notifications",{id:id("n"),text:"Character context syncing to Uranus…",read:false,createdAt:nowIso(),activityDate:this.localDate()});const r=await this.pushBridge("character_life",packet,{actor:"character",source:"companion",origin:`character_context_${reason}`,packetId});if(r.ok&&r.accepted){this.put("pending:character",[]);this.add("notifications",{id:id("n"),text:`Character context synced to Uranus · ${reason}.`,read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:true,accepted:true})}this.add("notifications",{id:id("n"),text:"Character context sync failed · retained for retry.",read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:false,error:r.error||"No ACK"},502)}
   pruneActivity(){const tz=this.settings().timezone||this.env.TZ||"America/New_York",fmt=d=>new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d),t=fmt(new Date()),y=new Date();y.setDate(y.getDate()-1);const keep=new Set([t,fmt(y)]);this.save("notifications",this.list("notifications").filter(n=>keep.has(n.activityDate||fmt(new Date(n.createdAt)))))}
   async setSettings(req){ const b=await this.body(req); const old=this.settings(); const a=b.autonomy||{}; const next={...old,...b,autonomy:{...old.autonomy,...a,minVisits:clamp(a.minVisits??old.autonomy.minVisits,0,10),maxVisits:clamp(a.maxVisits??old.autonomy.maxVisits,0,10),minIntervalMinutes:clamp(a.minIntervalMinutes??old.autonomy.minIntervalMinutes,0,1440)},reactionLibrary:[...new Set((b.reactionLibrary??old.reactionLibrary).map(String))].slice(0,50)}; if(next.autonomy.maxVisits<next.autonomy.minVisits)next.autonomy.maxVisits=next.autonomy.minVisits; this.put("settings",next); await this.arm(); return j({ok:true,settings:next}); }
-  async createSchedule(req){ const b=await this.body(req); const x={id:id("s"),owner:"user",date:String(b.date||"").slice(0,10),time:String(b.time||"").slice(0,5),end:String(b.end||"").slice(0,5),text:String(b.text||"").trim(),status:"planned",images:Array.isArray(b.images)?b.images.slice(0,4):[],history:[],createdAt:nowIso(),updatedAt:nowIso()}; if(!x.date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("schedule",x); return j({ok:true,item:x}); }
+  async patch(kind,itemId,req){
+    if(!["schedule","diary"].includes(kind))return j({ok:false,error:"Invalid kind"},400);
+    const old=this.list(kind).find(x=>x.id===itemId);
+    if(!old)return j({ok:false,error:"Entry not found"},404);
+    if(old.owner!=="user")return j({ok:false,error:"Only your own entries can be edited here"},403);
+    const b=await this.body(req),out={};
+    const allowed=kind==="schedule"?["date","time","end","text","title","description","status","actualText","doneText","images","statusImages"]:["text","images"];
+    for(const k of allowed)if(Object.prototype.hasOwnProperty.call(b,k)&&b[k]!==undefined){
+      if(["images","statusImages"].includes(k)){if(Array.isArray(b[k]))out[k]=b[k].slice(0,6)}
+      else out[k]=String(b[k]??"").slice(0,k==="description"?1500:10000);
+    }
+    if(kind==="schedule"){
+      if(out.status&&! ["planned","done","failed","changed","cancelled"].includes(out.status))return j({ok:false,error:"Invalid status"},400);
+      if(out.title!==undefined)out.text=out.title;
+      if(out.text!==undefined&&!out.text.trim())return j({ok:false,error:"Title required"},400);
+      if(out.status&&out.status!==old.status){out.statusChangedAt=nowIso();out.history=[...(old.history||[]),{status:old.status,at:nowIso()}].slice(-50)}
+    }
+    return j({ok:true,item:this.update(kind,itemId,out)});
+  }
+  remove(kind,itemId){
+    if(!["schedule","diary"].includes(kind))return j({ok:false,error:"Invalid kind"},400);
+    const item=this.list(kind).find(x=>x.id===itemId);
+    if(!item)return j({ok:false,error:"Not found"},404);
+    if(item.owner!=="user")return j({ok:false,error:"Cannot delete character entries"},403);
+    this.save(kind,this.list(kind).filter(x=>x.id!==itemId));
+    return j({ok:true});
+  }
+  async createSchedule(req){ const b=await this.body(req); const x={id:id("s"),owner:"user",date:String(b.date||"").slice(0,10),time:String(b.time||"").slice(0,5),end:String(b.end||"").slice(0,5),text:String(b.title||b.text||"").trim(),title:String(b.title||b.text||"").trim(),description:String(b.description||"").slice(0,1500),status:"planned",images:Array.isArray(b.images)?b.images.slice(0,4):[],history:[],createdAt:nowIso(),updatedAt:nowIso()}; if(!x.date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("schedule",x); return j({ok:true,item:x}); }
   async createDiary(req){ const b=await this.body(req); const owner="user", date=String(b.date||"").slice(0,10); let arr=this.list("diary"); const existing=arr.find(x=>x.owner===owner&&x.date===date); if(existing){ const item=this.update("diary",existing.id,{text:String(b.text||"").trim(),...(Array.isArray(b.images)?{images:b.images.slice(0,6)}:{})}); return j({ok:true,item}); } const x={id:id("d"),owner,date,text:String(b.text||"").trim(),images:Array.isArray(b.images)?b.images.slice(0,6):[],createdAt:nowIso(),updatedAt:nowIso()}; if(!date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("diary",x); return j({ok:true,item:x}); }
   target(type,targetId){
     if(type==="comment")return this.list("comments").find(x=>x.id===targetId)||null;

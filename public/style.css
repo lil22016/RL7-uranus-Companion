@@ -58,3 +58,8 @@ body.settings-mode .app{display:none!important}
 .commentTools{display:inline-flex;gap:5px;margin-left:8px}.commentTools .pill{font-size:10px;padding:3px 7px;opacity:.72}
 
 .entryImages{display:flex;gap:9px;overflow-x:auto;margin-top:10px}.entryImageWrap{min-width:145px;max-width:230px}.entryImageWrap img{width:100%;max-height:220px;object-fit:cover;border-radius:14px;display:block}.entryImageWrap small{display:block;font-size:11px;opacity:.6;margin-top:4px}.imageButtons{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.filePill{cursor:pointer}.completedOriginal>.row .text>div:first-child,.completedOriginal>.row .time{text-decoration:line-through;opacity:.48}.completionEvent{margin-top:8px;border-left:2px solid rgba(255,255,255,.22);padding-left:10px}.completionEvent .status{text-transform:uppercase;letter-spacing:.08em}
+
+/* Integrated activity list and per-owner typography */
+#charDay .activityTitle,#charDay .activityDescription{font-family:var(--character-font,inherit);color:var(--character-ink,#f5f3f1);font-size:var(--character-size,16px)}
+#userDay .activityTitle,#userDay .activityDescription{font-family:var(--user-font,inherit);color:var(--user-ink,#f5f3f1);font-size:var(--user-size,16px)}
+.activityDescription{opacity:.65;margin-top:5px;white-space:pre-wrap;line-height:1.35}.activityTitle{font-weight:600;white-space:pre-wrap}.appearanceRow{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #ffffff20}.appearanceRow label{display:flex;align-items:center;gap:6px}.appearanceRow input[type=number]{width:65px}.appearanceRow input:not([type=color]){max-width:180px}
