@@ -59,6 +59,13 @@ export class Companion extends DurableObject {
     if(p.startsWith("/api/suggestion/")&&p.endsWith("/accept")&&m==="POST") return this.acceptSuggestion(p.split("/")[3]);
     if(p.startsWith("/api/suggestion/")&&p.endsWith("/reject")&&m==="POST") return this.rejectSuggestion(p.split("/")[3]);
     if(p==="/api/font"&&m==="POST") return this.storeFont(req);
+    if(p==="/api/font/link"&&m==="POST") return this.storeFontLink(req);
+    if(p==="/api/music/state"&&m==="GET") return this.musicState();
+    if(p==="/api/music/cfg"&&m==="PUT") return this.musicCfgSave(req);
+    if(p==="/api/music/attitude"&&m==="POST") return this.musicAttitude(req);
+    if(p==="/api/music/react"&&m==="POST") return this.musicReact(req);
+    if(p==="/api/music/chat"&&m==="POST") return this.musicChat(req);
+    if(p==="/api/music/chat"&&m==="DELETE"){ this.save("music:chat",[]); return j({ok:true}); }
     if(p.startsWith("/api/font/")&&m==="GET") return this.readFont(p.split("/").pop());
     if(p.startsWith("/api/font/")&&m==="DELETE") return this.deleteFont(p.split("/").pop());
     if(p==="/api/diary"&&m==="POST") return this.createDiary(req);
@@ -238,7 +245,7 @@ export class Companion extends DurableObject {
   async storeImage(req){const b=await this.body(req),data=String(b.data||"");if(!/^data:image\/(jpeg|png|webp);base64,/i.test(data))return j({ok:false,error:"Image data required"},400);if(data.length>900000)return j({ok:false,error:"Image too large after compression"},413);const iid=id("img"),chunks=[];for(let n=0;n<data.length;n+=80000)chunks.push(data.slice(n,n+80000));chunks.forEach((x,n)=>this.put(`image:${iid}:${n}`,x));const meta={id:iid,chunks:chunks.length,summary:String(b.summary||"").slice(0,600),source:b.source==="generated"?"generated":"upload",createdAt:nowIso()};this.put(`image:${iid}:meta`,meta);return j({ok:true,image:{...meta,url:`/api/image/${iid}`}})}
   readImage(i){const m=this.imageMeta(i);if(!m)return j({ok:false,error:"Image not found"},404);let data="";for(let n=0;n<m.chunks;n++)data+=this.get(`image:${i}:${n}`,"");const mm=data.match(/^data:(image\/[^;]+);base64,(.*)$/s);if(!mm)return j({ok:false,error:"Invalid stored image"},500);const bin=Uint8Array.from(atob(mm[2]),c=>c.charCodeAt(0));return new Response(bin,{headers:{"content-type":mm[1],"cache-control":"private, max-age=31536000"}})}
   deleteImage(i){const m=this.imageMeta(i);if(m){for(let n=0;n<m.chunks;n++)this.ctx.storage.kv.delete(`image:${i}:${n}`);this.ctx.storage.kv.delete(`image:${i}:meta`)}for(const k of ["schedule","diary"])this.save(k,this.list(k).map(x=>({...x,images:(x.images||[]).filter(q=>q.id!==i),statusImages:(x.statusImages||[]).filter(q=>q.id!==i)})));return j({ok:true})}
-  async generateImage(req){const b=await this.body(req),cfg=this.settings().image;if(!cfg.enabled||!cfg.baseUrl||!cfg.model)return j({ok:false,error:"Configure Image Generation first"},400);const prompt=[cfg.positivePrompt,String(b.prompt||"")].map(x=>String(x||"").trim()).filter(Boolean).join("\n");if(!prompt)return j({ok:false,error:"Image prompt required"},400);let url=String(cfg.baseUrl).replace(/\/+$/,"");if(!url.endsWith("/images/generations"))url+="/images/generations";const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${cfg.apiKey||""}`},body:JSON.stringify({model:cfg.model,prompt,n:1,size:"1024x1024",response_format:"b64_json"})});const raw=await r.text();if(!r.ok)throw new Error(`Image API ${r.status}: ${raw.slice(0,300)}`);let o;try{o=JSON.parse(raw)}catch{throw new Error("Image API returned invalid JSON")}const it=o?.data?.[0];let data=it?.b64_json?`data:image/png;base64,${it.b64_json}`:"";if(!data&&it?.url){const rr=await fetch(it.url);const buf=new Uint8Array(await rr.arrayBuffer());let str="";for(let n=0;n<buf.length;n+=8192)str+=String.fromCharCode(...buf.slice(n,n+8192));data=`data:${rr.headers.get("content-type")||"image/png"};base64,${btoa(str)}`}if(!data)throw new Error("Image API returned no image");return this.storeImage(new Request("https://local/api/image",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({data,source:"generated"})}))}
+  async generateImage(req){const b=await this.body(req),cfg0=this.settings().image,cfg={...cfg0};if(cfg0.source==="uranus"&&cfg0.uranusProviderId){try{const rp=await this.resolveUranusProvider(cfg0.uranusProviderId);cfg.baseUrl=rp.baseUrl;cfg.apiKey=rp.apiKey}catch(e){return j({ok:false,error:String(e.message||e)},400)}}if(!cfg.enabled||!cfg.baseUrl||!cfg.model)return j({ok:false,error:"Configure Image Generation first"},400);const prompt=[cfg.positivePrompt,String(b.prompt||"")].map(x=>String(x||"").trim()).filter(Boolean).join("\n");if(!prompt)return j({ok:false,error:"Image prompt required"},400);let url=String(cfg.baseUrl).replace(/\/+$/,"");if(!url.endsWith("/images/generations"))url+="/images/generations";const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${cfg.apiKey||""}`},body:JSON.stringify({model:cfg.model,prompt,n:1,size:"1024x1024",response_format:"b64_json"})});const raw=await r.text();if(!r.ok)throw new Error(`Image API ${r.status}: ${raw.slice(0,300)}`);let o;try{o=JSON.parse(raw)}catch{throw new Error("Image API returned invalid JSON")}const it=o?.data?.[0];let data=it?.b64_json?`data:image/png;base64,${it.b64_json}`:"";if(!data&&it?.url){const rr=await fetch(it.url);const buf=new Uint8Array(await rr.arrayBuffer());let str="";for(let n=0;n<buf.length;n+=8192)str+=String.fromCharCode(...buf.slice(n,n+8192));data=`data:${rr.headers.get("content-type")||"image/png"};base64,${btoa(str)}`}if(!data)throw new Error("Image API returned no image");return this.storeImage(new Request("https://local/api/image",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({data,source:"generated"})}))}
   async summarizeImage(req){const b=await this.body(req),iid=String(b.imageId||""),m=this.imageMeta(iid);if(!m)return j({ok:false,error:"Image not found"},404);let data="";for(let n=0;n<m.chunks;n++)data+=this.get(`image:${iid}:${n}`,"");const st=this.settings(),p=st.modelProfiles.find(x=>x.id===st.agent.profileId);if(!p)return j({ok:false,error:"Select an active Companion model"},400);const base=String(p.baseUrl||"").replace(/\/+$/,""),url=base.endsWith("/chat/completions")?base:base+"/chat/completions";const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${p.apiKey||""}`,...(p.headers||{})},body:JSON.stringify({model:p.model,messages:[{role:"user",content:[{type:"text",text:"Describe this image for memory/context in one short factual sentence. Mention only clearly visible content relevant to a diary/calendar event. No inference or backstory. Return only the sentence."},{type:"image_url",image_url:{url:data}}]}],max_tokens:100})});const raw=await r.text();if(!r.ok)throw new Error(`Vision summary ${r.status}: ${raw.slice(0,240)}`);let o;try{o=JSON.parse(raw)}catch{throw new Error("Vision model returned invalid JSON")}const summary=String(o?.choices?.[0]?.message?.content||"").trim().slice(0,600);if(!summary)throw new Error("Empty image summary");this.put(`image:${iid}:meta`,{...m,summary});return j({ok:true,summary})}
   imageContext(x){const z=(x.images||[]).map(q=>q.summary||this.imageMeta(q.id)?.summary).filter(Boolean);return z.length?` Image: ${z.join("; ")}`:""}
   queueCharacter(text){const q=this.get("pending:character",[]);q.push({id:crypto.randomUUID(),text:String(text).slice(0,1600),createdAt:nowIso()});this.put("pending:character",q.slice(-100))}
@@ -688,6 +695,91 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
     const sug=this.update("suggestions",g.id,{status:"rejected",resolvedAt:nowIso()});
     await this.queueSession([{type:"suggestion_reject",summary:`“${g.text}” instead of “${g.targetText}”`}]);
     return j({ok:true,suggestion:sug});
+  }
+
+  /* ───────── 用 Uranus「连接」里的 API（不复制密钥，每次调用时现取） ───────── */
+  async resolveUranusProvider(pid){
+    const cfg=await this.uranus("/api/config");
+    const p=(cfg.providers||[]).find(x=>x.id===pid);
+    if(!p)throw new Error("That Uranus connection no longer exists. Pick it again in Settings.");
+    const t=String(p.type||"custom");
+    if(t!=="custom"&&t!=="openai")throw new Error(`Uranus connection "${p.name||p.id}" is a ${t} type (not OpenAI-compatible). Pick a custom/OpenAI one.`);
+    const key=(p.keys||[]).map(String).find(k=>k.trim())||"";
+    return {baseUrl:String(p.url||"").trim().replace(/\/+$/,""),apiKey:key};
+  }
+  async resolveLLM(sel){
+    const s=this.settings();sel=sel||{};
+    if(sel.source==="uranus"&&sel.uranusProviderId){
+      const rp=await this.resolveUranusProvider(sel.uranusProviderId);
+      if(!sel.model)throw new Error("Choose a model for the Uranus connection.");
+      return {baseUrl:rp.baseUrl,path:"/chat/completions",apiKey:rp.apiKey,model:sel.model,headers:{}};
+    }
+    const pr=s.modelProfiles.find(x=>x.id===(sel.profileId||s.agent.profileId));
+    if(!pr)throw new Error("Choose a model (Companion model profile or a Uranus connection) first.");
+    return {baseUrl:String(pr.baseUrl||"").replace(/\/$/,""),path:pr.path||"/chat/completions",apiKey:pr.apiKey||"",model:pr.model,headers:pr.headers||{}};
+  }
+  async callLLM(sel,messages,maxTokens=400){
+    const m=await this.resolveLLM(sel);
+    const base=m.baseUrl,url=/\/chat\/completions$/.test(base)?base:base+m.path;
+    const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${m.apiKey}`,...m.headers},body:JSON.stringify({model:m.model,messages,max_tokens:maxTokens,temperature:0.9})});
+    const t=await r.text();if(!r.ok)throw new Error(`Model ${r.status}: ${t.slice(0,240)}`);
+    let o;try{o=JSON.parse(t)}catch{throw new Error("Model returned a non-JSON envelope")}
+    return String(o.choices?.[0]?.message?.content??o.output_text??"").trim();
+  }
+
+  /* ───────── 一起听歌 ───────── */
+  musicCfg(){return {source:"profile",profileId:"",uranusProviderId:"",model:"",commentChance:0.25,attitudeChance:0.2,skipChance:0.05,...(this.get("music:cfg",{})||{})}}
+  musicState(){return j({ok:true,cfg:this.musicCfg(),attitudes:this.list("music:att"),chat:this.list("music:chat").slice(-60),characterName:this.settings().characterName,userName:this.settings().userName})}
+  async musicCfgSave(req){const b=await this.body(req),o=this.musicCfg();const n={...o};
+    for(const k of ["source","profileId","uranusProviderId","model"])if(b[k]!==undefined)n[k]=String(b[k]).slice(0,200);
+    for(const k of ["commentChance","attitudeChance","skipChance"])if(b[k]!==undefined)n[k]=clamp(Number(b[k])||0,0,1);
+    this.put("music:cfg",n);return j({ok:true,cfg:n})}
+  cleanSong(x){x=x||{};return {id:String(x.id||"").slice(0,40),name:String(x.name||"").slice(0,120),artist:String(x.artist||"").slice(0,120),cover:/^https?:\/\//.test(String(x.cover||""))?String(x.cover).slice(0,400):""}}
+  setAttitude(song,attitude,by){
+    let arr=this.list("music:att").filter(a=>!(a.song.id===song.id&&a.by===by));
+    if(attitude==="like"||attitude==="dislike")arr.push({id:id("ma"),song,attitude,by,at:nowIso()});
+    this.save("music:att",arr.slice(-300));
+  }
+  async musicAttitude(req){const b=await this.body(req),song=this.cleanSong(b.song);if(!song.id)return j({ok:false,error:"song required"},400);
+    this.setAttitude(song,b.attitude,"character");return j({ok:true,attitudes:this.list("music:att")})}
+  musicSystem(extra){
+    const s=this.settings(),lang=String(s.agent.language||"").trim();
+    return `${lang?`OUTPUT LANGUAGE: write in ${lang}.\n`:""}You are ${s.characterName}, listening to music together with ${s.userName} (like sharing one pair of headphones). Stay in character.\nPERSONA:\n${String(s.agent.persona||"").slice(0,2500)||"(none)"}\n${extra}`;
+  }
+  async musicReact(req){
+    const b=await this.body(req),song=this.cleanSong(b.song),cfg=this.musicCfg();
+    if(!song.id)return j({ok:false,error:"song required"},400);
+    const line=String(b.lyricLine||"").slice(0,200),pos=Math.round(Number(b.position)||0),allowSkip=!!b.allowSkip;
+    const sys=this.musicSystem(`You are listening to "${song.name}" by ${song.artist||"unknown"}${line?`; the current lyric line is: "${line}"`:""} (at ${pos}s). React the way YOU would, briefly: one or two short sentences at most, no emojis spam. You may also decide whether you like or dislike this song (only if you really feel it; otherwise "none")${allowSkip?", and you may ask to skip it if it truly isn't for you":""}.\nReturn ONLY JSON: {"text":"your short reaction","attitude":"like|dislike|none","skip":false}`);
+    let out;try{out=await this.callLLM(cfg,[{role:"system",content:sys},{role:"user",content:"React now."}],300)}catch(e){return j({ok:false,error:String(e.message||e)},400)}
+    let o={};try{o=JSON.parse(out.replace(/^```json\s*|\s*```$/g,""))}catch{o={text:out.slice(0,200),attitude:"none"}}
+    const skip=allowSkip&&o.skip===true,text=(b.wantText===false&&!skip)?"":String(o.text||"").trim().slice(0,300),att=(b.wantAttitude!==false&&["like","dislike"].includes(o.attitude))?o.attitude:"none";
+    if(text)this.add("music:chat",{id:id("mc"),role:"character",text,song,at:nowIso(),kind:"react"});
+    if(att!=="none")this.setAttitude(song,att,"character");
+    this.save("music:chat",this.list("music:chat").slice(-80));
+    return j({ok:true,text,attitude:att,skip,attitudes:this.list("music:att")});
+  }
+  async musicChat(req){
+    const b=await this.body(req),song=this.cleanSong(b.song),cfg=this.musicCfg(),text=String(b.text||"").trim().slice(0,600);
+    if(!text)return j({ok:false,error:"text required"},400);
+    this.add("music:chat",{id:id("mc"),role:"user",text,song,at:nowIso()});
+    const hist=this.list("music:chat").slice(-12).map(m=>({role:m.role==="user"?"user":"assistant",content:m.text}));
+    const line=String(b.lyricLine||"").slice(0,200);
+    const sys=this.musicSystem(`You are chatting in a tiny music-room chat box about music only (the song, lyrics, taste, mood). ${song.id?`Now playing: "${song.name}" by ${song.artist||"unknown"}${line?`; current lyric: "${line}"`:""}.`:"Nothing is playing right now."} Keep every reply SHORT (one or two sentences). Plain text only, no JSON.`);
+    let out;try{out=await this.callLLM(cfg,[{role:"system",content:sys},...hist],300)}catch(e){return j({ok:false,error:String(e.message||e)},400)}
+    const reply=out.replace(/^```\w*\s*|\s*```$/g,"").trim().slice(0,400);
+    if(reply)this.add("music:chat",{id:id("mc"),role:"character",text:reply,song,at:nowIso(),kind:"chat"});
+    this.save("music:chat",this.list("music:chat").slice(-80));
+    return j({ok:true,reply});
+  }
+  /* 字体：只存链接（不占 Companion 的存储）。.woff2/.woff/.ttf/.otf 直链，或 Google Fonts 这类 CSS 链接（要填字体名） */
+  async storeFontLink(req){
+    const b=await this.body(req);let u;try{u=new URL(String(b.url||"").trim())}catch{return j({ok:false,error:"Enter a valid font link"},400)}
+    if(u.protocol!=="https:")return j({ok:false,error:"Font link must be https://"},400);
+    const kind=/\.(woff2?|ttf|otf)$/i.test(u.pathname)?"file":"css",family=String(b.family||"").trim().slice(0,80);
+    if(kind==="css"&&!family)return j({ok:false,error:"For a CSS link (e.g. Google Fonts) also enter the font family name"},400);
+    const meta={id:id("f"),name:String(b.name||family||u.pathname.split("/").pop()||"Font").slice(0,80),url:u.href,kind,family,ext:kind==="file"?u.pathname.split(".").pop().toLowerCase():"css",chunks:0,createdAt:nowIso()};
+    this.put(`font:${meta.id}:meta`,meta);this.add("fonts",meta);return j({ok:true,font:meta});
   }
   async storeFont(req){
     const b=await this.body(req),ext=String(b.ext||"").toLowerCase().replace(/^\./,""),b64=String(b.b64||"");
