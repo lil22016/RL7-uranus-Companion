@@ -1,25 +1,24 @@
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-let key="", data=null, diaryOwner="character", session=[], calendarMonth=null, previousPage='calendar', sessionTimer=null;
+let key=localStorage.companionKey||"", data=null, diaryOwner="character", session=[], calendarMonth=null, previousPage='calendar', sessionTimer=null;
 const SESSION_IDLE_MS=5*60*1000;
 const today=()=>new Date().toLocaleDateString('en-CA');
 $('#date').value=$('#diaryDate').value=today();
-// Remember a successful Companion login on this browser origin. Never persist an unverified password.
-let authDialogPromise=null;
-function requestCompanionPassword(){
- if(authDialogPromise)return authDialogPromise;
- authDialogPromise=new Promise(resolve=>{
-  const dlg=document.getElementById('companionLogin');
-  const input=document.getElementById('companionLoginPassword');
-  const error=document.getElementById('companionLoginError');
-  input.value='';error.textContent='';
-  const finish=value=>{dlg.removeEventListener('close',onClose);authDialogPromise=null;resolve(value)};
-  const onClose=()=>finish(null);
-  dlg.addEventListener('close',onClose,{once:true});
-  document.getElementById('companionLoginForm').onsubmit=e=>{e.preventDefault();const v=input.value;if(!v)return;dlg.removeEventListener('close',onClose);dlg.close();finish(v)};
-  dlg.showModal();input.focus();
- });
+let pwPending=null;
+function askPassword(wrong){
+  if(pwPending)return pwPending;
+  pwPending=new Promise(res=>{
+    const o=document.createElement('div');
+    o.style.cssText='position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px;background:#080a10cc;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)';
+    o.innerHTML='<form style="width:min(380px,100%);padding:24px;border-radius:24px;border:1px solid #ffffff40;background:linear-gradient(145deg,#383944f5,#22242ef8);color:#f7f3f1;box-shadow:0 30px 95px #0009;font:15px/1.5 -apple-system,BlinkMacSystemFont,sans-serif"><div style="font:400 24px Georgia,serif;margin-bottom:6px">Companion</div><div id="pwMsg" style="font-size:13px;color:#c9bec3;margin-bottom:14px"></div><input id="pwIn" type="password" autocomplete="current-password" placeholder="Password" style="width:100%;padding:13px;border-radius:12px;border:1px solid #ffffff36;background:#ffffff10;color:#fff;font-size:16px;outline:none"><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px"><button type="button" id="pwNo" style="background:#ffffff20;border:1px solid #ffffff30;border-radius:12px;padding:10px 14px;color:#f3e9dd">Cancel</button><button type="submit" style="background:#d6c2a8;color:#242128;border:0;border-radius:12px;padding:10px 18px;font-weight:650">Unlock</button></div><div style="font-size:11px;color:#9f97a3;margin-top:14px;line-height:1.5">The password is the COMPANION_PASSWORD secret of this Worker (the same value as COMPANION_KEY in the Pages project).</div></form>';
+    o.querySelector('#pwMsg').textContent=wrong?'Wrong password. Try again.':'This Companion is password protected.';
+    document.body.appendChild(o);const inp=o.querySelector('#pwIn');setTimeout(()=>inp.focus(),50);
+    const done=v=>{o.remove();pwPending=null;res(v)};
+    o.querySelector('form').onsubmit=e=>{e.preventDefault();done(inp.value)};
+    o.querySelector('#pwNo').onclick=()=>done(null);
+  });
+  return pwPending;
 }
-async function api(path,opt={}){ const r=await fetch('/api'+path,{...opt,headers:{'content-type':'application/json',...opt.headers}}); const x=await r.json(); if(!x.ok)throw Error(x.error||'Request failed'); return x; }
+async function api(path,opt={}){ const r=await fetch('/api'+path,{...opt,headers:{'content-type':'application/json','x-companion-key':key,...opt.headers}}); if(r.status===401){ const wrong=!!key; key=''; localStorage.removeItem('companionKey'); const k=await askPassword(wrong); if(k!==null&&k!==''){key=k;localStorage.companionKey=k;return api(path,opt)} throw Error('Password required'); } const x=await r.json(); if(!x.ok)throw Error(x.error||'Request failed'); return x; }
 function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),1500)}
 let lastNotificationId=localStorage.lastCompanionNotificationId||'';
 async function load(){try{data=await api('/bootstrap');render();maybeNotify()}catch(e){toast(e.message)}}
@@ -46,8 +45,8 @@ function interactions(type,id){
 }
 function who(a){return a==='character'?esc(data.settings.characterName):esc(data.settings.userName)}
 function itemHtml(x){const mine=x.owner==='user',changed=x.status==='changed'&&x.actualText,done=x.status==='done';
- const title=changed?`<div class="struck">${esc(x.title||x.text)}</div><div class="actual">${esc(x.actualText)}</div>`:`<div class="activityTitle">${esc(x.title||x.text)}</div>${x.description?`<div class="activityDescription">${esc(x.description)}</div>`:''}`,status=mine?`<button class="status statusButton" data-id="${x.id}">${esc(x.status==='changed'?'Changed plan':x.status)} ▾</button>`:`<span class="status">${esc(x.status==='changed'?'Changed plan':x.status)}</span>`;
- const original=`<div class="item ${done?'completedOriginal':''}" data-id="${x.id}"><div class="row"><div class="time">${x.time?esc(x.time):''}${x.end?`–${esc(x.end)}`:''}</div><div class="text">${title}<div>${status}</div>${imageStrip(x.images||[])}${mine?`<div class="ownerTools"><button class="pill editSchedule" data-id="${x.id}">Edit</button><button class="pill deleteSchedule" data-id="${x.id}">Delete</button></div>`:''}</div></div>${interactions('schedule',x.id)}${!mine?`<div class="thread"><button class="pill react" data-type="schedule" data-id="${x.id}" data-text="${attr(x.text)}">React</button> <button class="pill commentBtn" data-type="schedule" data-id="${x.id}" data-text="${attr(x.text)}">Comment</button></div>`:''}</div>`;
+ const title=changed?`<div class="struck">${esc(x.text)}</div><div class="actual">${esc(x.actualText)}</div>`:esc(x.text),status=mine?`<button class="status statusButton" data-id="${x.id}">${esc(x.status==='changed'?'Changed plan':x.status)} ▾</button>`:`<span class="status">${esc(x.status==='changed'?'Changed plan':x.status)}</span>`;
+ const original=`<div class="item ${done?'completedOriginal':''}" data-id="${x.id}"><div class="row"><div class="time">${esc(x.time||'Anytime')}${x.end?`–${esc(x.end)}`:''}</div><div class="text">${title}<div>${status}</div>${imageStrip(x.images||[])}${mine?`<div class="ownerTools"><button class="pill editSchedule" data-id="${x.id}">Edit</button><button class="pill deleteSchedule" data-id="${x.id}">Delete</button></div>`:''}</div></div>${interactions('schedule',x.id)}${!mine?`<div class="thread"><button class="pill react" data-type="schedule" data-id="${x.id}" data-text="${attr(x.text)}">React</button> <button class="pill commentBtn" data-type="schedule" data-id="${x.id}" data-text="${attr(x.text)}">Comment</button></div>`:''}</div>`;
  if(!done)return original;const tm=x.statusChangedAt?new Date(x.statusChangedAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'Done';
  return original+`<div class="item completionEvent"><div class="row"><div class="time">${esc(tm)}</div><div class="text"><div class="status">Done · ${who(x.owner)}</div>${esc(x.doneText||x.text)}${imageStrip(x.statusImages||[])}</div></div></div>`}
 function renderCalendar(){const d=$('#date').value; updateCalendarLabel(); $('#charDay').innerHTML=panel('character',`${who('character')}'s Day`,dateItems('character',d),`<button class="pill agent" data-mode="write_schedule">Ask to write</button>`); $('#userDay').innerHTML=panel('user',`${who('user')}'s Day`,dateItems('user',d),`<button class="pill addSchedule">+ Add</button><button class="pill agent" data-mode="look_schedule">Ask ${who('character')} to look</button>`); bindInteractions()}
@@ -74,8 +73,8 @@ function replyComment(id){const c=data.comments.find(x=>x.id===id&&x.actor==='ch
 function editComment(id){const c=data.comments.find(x=>x.id===id&&x.actor==='user');if(!c)return;openEdit('Edit comment',`<label class="wide">Comment<textarea id="editCommentText">${esc(c.text)}</textarea></label>`,async()=>{const text=$('#editCommentText').value.trim();if(!text)throw Error('Comment required');await api('/comment/'+id,{method:'PATCH',body:JSON.stringify({text})});await load()})}
 async function deleteComment(id){if(!confirm('Delete this comment and its replies?'))return;try{await api('/comment/'+id,{method:'DELETE'});await load();toast('Comment deleted')}catch(e){toast(e.message)}}
 $('#commentSend').onclick=async()=>{const t=$('#commentInput').value.trim();if(!t)return toast('Enter a comment');const b=commentTarget;if(!b)return;try{await api('/comment',{method:'POST',body:JSON.stringify({actor:'user',targetType:b.dataset.type,targetId:b.dataset.id,text:t})});touchSession({type:'comment',text:t,targetText:b.dataset.text});$('#commentDialog').close();await load()}catch(x){toast(x.message)}};
-function scheduleForm(x){return `<label>Title<input id="eTitle" value="${attr(x?.title||x?.text||'')}" required></label><label class="wide">Description<textarea id="eDescription">${esc(x?.description||'')}</textarea></label><label>Date<input id="eDate" type="date" value="${attr(x?.date||$('#date').value)}"></label><label>Start<input id="eTime" type="time" value="${attr(x?.time||'')}"></label><label>End<input id="eEnd" type="time" value="${attr(x?.end||'')}"></label>${imageEditor(x?.images||[])}`}
-function scheduleBody(){return {date:$('#eDate').value,time:$('#eTime').value,end:$('#eEnd').value,text:$('#eTitle').value.trim(),title:$('#eTitle').value.trim(),description:$('#eDescription').value.trim(),images:window._editImages||[]}}
+function scheduleForm(x){return `<label>Date<input id="eDate" type="date" value="${attr(x?.date||$('#date').value)}"></label><label>Start<input id="eTime" type="time" value="${attr(x?.time||'')}"></label><label>End<input id="eEnd" type="time" value="${attr(x?.end||'')}"></label><label class="wide">Plan<textarea id="eText">${esc(x?.text||'')}</textarea></label>${imageEditor(x?.images||[])}`}
+function scheduleBody(){return {date:$('#eDate').value,time:$('#eTime').value,end:$('#eEnd').value,text:$('#eText').value,images:window._editImages||[]}}
 function addSchedule(){openEdit('Add schedule',scheduleForm(),async()=>{const body={...scheduleBody(),owner:'user'};await api('/schedule',{method:'POST',body:JSON.stringify(body)});touchSession({type:'write_schedule',summary:body.text});await load()})}
 function editSchedule(id){const x=data.schedule.find(x=>x.id===id&&x.owner==='user');if(!x)return;openEdit('Edit schedule',scheduleForm(x),async()=>{await api('/schedule/'+id,{method:'PATCH',body:JSON.stringify(scheduleBody())});await load()})}
 async function deleteSchedule(id){if(!confirm('Delete this schedule entry? This cannot be undone.'))return;try{await api('/schedule/'+id,{method:'DELETE'});await load();toast('Deleted')}catch(e){toast(e.message)}}
@@ -137,9 +136,3 @@ function bindImageEditor(){const redraw=()=>{const el=$('#editImageList');if(el)
 load();
 
 if($('#prevActivity'))$('#prevActivity').onclick=()=>{shift($('#activityDate'),-1);renderNotifications()};if($('#nextActivity'))$('#nextActivity').onclick=()=>{shift($('#activityDate'),1);renderNotifications()};if($('#activityDate'))$('#activityDate').onchange=renderNotifications;
-
-
-// Companion-only typography settings; never touches the parent Uranus document.
-function applyCompanionAppearance(){let a={};try{a=JSON.parse(localStorage.getItem('rl7CompanionAppearance')||'{}')}catch{};for(const owner of ['user','character']){const x=a[owner]||{};const root=document.documentElement;root.style.setProperty(`--${owner}-ink`,/^#[0-9a-fA-F]{6}$/.test(x.color||'')?x.color:'#f5f3f1');root.style.setProperty(`--${owner}-size`,Math.max(12,Math.min(26,Number(x.size)||16))+'px');root.style.setProperty(`--${owner}-font`,/^[\w ,"'-]{1,100}$/.test(x.font||'')?x.font:'inherit')}}
-function initCompanionAppearance(){const target=document.getElementById('companionAppearance');if(!target)return;let a={};try{a=JSON.parse(localStorage.getItem('rl7CompanionAppearance')||'{}')}catch{};for(const owner of ['user','character']){const x=a[owner]||{};target.insertAdjacentHTML('beforeend',`<div class="appearanceRow"><strong>${owner==='user'?'My Day':"Loki's Day"}</strong><label>Ink <input type="color" data-owner="${owner}" data-prop="color" value="${/^#[0-9a-fA-F]{6}$/.test(x.color||'')?x.color:'#f5f3f1'}"></label><label>Size <input type="number" min="12" max="26" data-owner="${owner}" data-prop="size" value="${Number(x.size)||16}"></label><label>Font family <input data-owner="${owner}" data-prop="font" placeholder="Georgia, serif" value="${attr(x.font||'')}"></label></div>`)}target.addEventListener('change',e=>{const el=e.target;if(!el.dataset.owner)return;let next={};try{next=JSON.parse(localStorage.getItem('rl7CompanionAppearance')||'{}')}catch{};next[el.dataset.owner]={...(next[el.dataset.owner]||{}),[el.dataset.prop]:el.value};localStorage.setItem('rl7CompanionAppearance',JSON.stringify(next));applyCompanionAppearance()});applyCompanionAppearance()}
-initCompanionAppearance();
