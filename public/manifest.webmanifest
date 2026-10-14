@@ -1,10 +1,10 @@
 {
-  "name": "RL7 Companion",
-  "short_name": "RL7",
-  "start_url": "/",
+  "name": "Companion",
+  "short_name": "Companion",
   "display": "standalone",
-  "background_color": "#111111",
-  "theme_color": "#111111",
+  "start_url": "/",
+  "background_color": "#222222",
+  "theme_color": "#222222",
   "icons": [
     {
       "src": "/icon-192.png",
