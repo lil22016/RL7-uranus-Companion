@@ -13,6 +13,7 @@ const DEFAULTS = {
   bridge:{enabled:false,url:"",key:"",immediateReaction:"decide",maxContextChars:2800},
   image:{enabled:false,baseUrl:"",apiKey:"",model:"",positivePrompt:""},
   appearance:{my:{},loki:{},css:""},
+  organizer:{enabled:false,roleKey:"",profileId:"",intervalMinutes:60},
   simplifyPrompt:"You compress a Companion activity session for another AI that already knows the user and character. Minimize tokens aggressively WITHOUT losing meaningful information or temporal context.\n\nRULES:\n1. Preserve ALL meaningful facts, outcomes, status changes, emotions, relationship cues, jokes, requests, promises, concerns, and user intent. Compression must not make meaningful information disappear merely because it seems casual.\n2. Preserve TIME CONTEXT. Each source event includes its local date/time. Keep exact or concise time references whenever timing affects meaning, chronology, behavior, or how the receiving character may respond (for example: staying up late, waking early, deadlines, meals, appointments, travel, or something happening unusually late/early). For multiple events close together, you may state one shared time/range instead of repeating timestamps. Do not drop a time merely to save tokens when it changes the meaning.\n3. Merge duplicate lifecycle events about the same item (created/planned/updated/done/etc.) into one concise statement reflecting the final state while retaining meaningful changes.\n4. Merge reactions and comments aimed at the same character entry when natural.\n5. Short source wording that is already efficient may be kept verbatim, especially distinctive emotional/relationship language. Long wording may be paraphrased, but ALL meaningful semantic content must still be conveyed.\n6. Preserve short direct quotes when exact wording, humor, affection, teasing, or tone matters. Do not preserve long wording merely for style.\n7. Never invent, infer, embellish, correct, moralize, or add facts. Do not change actor, target, chronology, time, completion status, or intent.\n8. Do not summarize away details that could change how the receiving character understands or responds.\n9. Remove mechanical repetition, UI wording, redundant target text, and duplicated descriptions.\n10. Use compact plain text, usually one line per distinct semantic event. No headings, analysis, JSON, or explanatory preamble.\n11. Aim for the fewest tokens possible AFTER satisfying all preservation rules. Accuracy, semantic completeness, and relevant temporal context outrank brevity.\n\nReturn ONLY the compressed session text."
 };
 
@@ -29,7 +30,7 @@ export class Companion extends DurableObject {
     const u=new URL(req.url), p=u.pathname, m=req.method;
     if(p==="/api/health") return j({ok:true});
     if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
-    if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse(),suggestions:this.list("suggestions"),fonts:this.list("fonts")});
+    if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse(),organizer:this.get("org:state",null),suggestions:this.list("suggestions"),fonts:this.list("fonts")});
     if(p==="/api/settings"&&m==="PUT") return this.setSettings(req);
     if(p==="/api/image"&&m==="POST") return this.storeImage(req);
     if(p.startsWith("/api/image/")&&m==="GET") return this.readImage(p.split("/").pop());
@@ -43,6 +44,8 @@ export class Companion extends DurableObject {
     if(p.startsWith("/api/schedule/")&&m==="DELETE") return this.remove("schedule",p.split("/").pop());
     if(p.startsWith("/api/schedule/")&&p.endsWith("/change")&&m==="POST") return this.changeSchedule(p.split("/")[3],req);
     if(p==="/api/suggest/run"&&m==="POST") return this.suggestRun(req);
+    if(p==="/api/organizer/roles"&&m==="GET") return this.organizerRoles();
+    if(p==="/api/organizer/run"&&m==="POST") return this.organizerRoute(req);
     if(p.startsWith("/api/suggestion/")&&p.endsWith("/accept")&&m==="POST") return this.acceptSuggestion(p.split("/")[3]);
     if(p.startsWith("/api/suggestion/")&&p.endsWith("/reject")&&m==="POST") return this.rejectSuggestion(p.split("/")[3]);
     if(p==="/api/font"&&m==="POST") return this.storeFont(req);
@@ -386,12 +389,13 @@ export class Companion extends DurableObject {
     if(!profile)throw new Error("Choose a model profile in Settings first.");
     const pending=this.get("pending:user",[]),date=/^\d{4}-\d{2}-\d{2}$/.test(requestedDate||"")?requestedDate:this.localDate();
     const localNow=this.localNow();
+    const uctx=await this.uranusContext(date);
     if((mode==="write_schedule"||mode==="write_diary")&&date>localNow.date)throw new Error("Ask Loki to Write cannot invent lived events for a future date.");
     const userScheduleForDate=this.list("schedule").filter(x=>x.owner==="user"&&x.date===date);
     const userDiaryForDate=this.list("diary").filter(x=>x.owner==="user"&&x.date===date);
     const todayWriteRule=date===localNow.date?`TODAY SAFETY RULE: It is currently ${localNow.time} in ${localNow.timeZone}. Write ONLY events that have already happened or are happening now. NEVER invent, predict, pre-fill, or schedule events later than ${localNow.time}. For schedule writing today, every new schedule item MUST include an explicit HH:MM start time that is not later than ${localNow.time}; any end time must also not be later than ${localNow.time}. If only one real/present activity is appropriate, write only one. Do not fill the rest of the day.`:`The target date is in the past, so you may describe events from that completed day.`;
     const instruction=mode==="write_schedule"?`MANDATORY: Create at least ONE nonempty schedule item in the schedule array for ${date}. You are writing YOUR OWN lived day, not merely looking. Do not invent content just to fill the calendar. ${todayWriteRule}`:mode==="write_diary"?`MANDATORY: Write a nonempty diary object {"date":"${date}","text":"..."}. Write YOUR OWN diary, even if it is just 1-2 natural sentences. Do not return null diary. ${todayWriteRule}`:mode==="look_schedule"?`LOOK ONLY at the user's schedule. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on a USER schedule entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every schedule interaction, targetType MUST be "schedule" and targetId MUST be an exact schedule id shown in ELIGIBLE TARGETS. Never return with both comments and reactions empty.`:mode==="look_diary"?`LOOK ONLY at the user's diary. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on the USER diary entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every diary interaction, targetType MUST be "diary" and targetId MUST be the exact diary id shown in ELIGIBLE TARGETS. Never use "schedule" for a diary interaction. Never return with both comments and reactions empty.`:`AUTONOMOUS VISIT. Prefer living YOUR OWN life rather than hovering over the user. Across visits, balance three categories roughly evenly: (A) write/update YOUR schedule, (B) write YOUR diary when no diary exists today, (C) interact with the USER. Do not repeatedly choose C just because user activity exists. At most ONE comment/reply per target or user comment in a visit. Never leave a second character reply under the same user comment. If replying to a user comment, use targetType "comment" and its exact comment id. Do not pile multiple standalone comments onto the same user entry. It is fine to write only your own life and not react to the user.`;
-    const prompt=`You are ${s.characterName}. Return ONLY valid JSON.\nMODE: ${mode}\nTARGET DATE: ${date}\nLOCAL TIMEZONE: ${s.timezone}\nCURRENT UTC: ${nowIso()}\nIMPORTANT INSTRUCTION: ${instruction}\nYou can change the status of YOUR OWN existing schedules using updates [{"id":"existing id","status":"done|failed|cancelled|changed","actualText":"required only for changed"}]. Do not edit or delete original schedule text.\nYou can ONLY comment/react to the USER's existing entries. Never comment/react to your own.\nPERSONA:\n${s.agent.persona}\nUSER:\n${s.agent.userPersona}\nWORLDBOOK:\n${s.agent.worldbook}\nSPECIAL INSTRUCTIONS:\n${s.agent.instructions}\nAVAILABLE REACTIONS: ${s.reactionLibrary.join(" ")}\nELIGIBLE TARGETS FOR THIS REQUEST:\n${mode==="look_diary"?JSON.stringify(userDiaryForDate):mode==="look_schedule"?JSON.stringify(userScheduleForDate):"n/a"}\nINTERACTION JSON SCHEMA: comments use {"targetType":"schedule|diary|comment","targetId":"exact existing entry/comment id","text":"..."}. targetType "comment" means reply to an existing USER comment; reactions use {"targetType":"schedule|diary","targetId":"exact existing id","emoji":"one AVAILABLE REACTION"}.\nRECENT USER ACTIVITY:\n${this.compactActivity(pending)}\nEXISTING COMMENT THREADS (do not duplicate a character reply to the same user comment):\n${JSON.stringify(this.list("comments").slice(-40))}\nYOUR SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="character").slice(-30))}\nUSER SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="user").slice(-30))}\nYOUR DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="character").slice(-7))}\nUSER DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="user").slice(-7))}\nOPTIONAL IMAGE: for YOUR OWN schedule/diary only, when an image would naturally enrich the entry and Image Generation is enabled, add "imagePrompt":"short visual prompt" to that schedule item or diary object. Do not create images for user entries.
+    const prompt=`You are ${s.characterName}. Return ONLY valid JSON.\nMODE: ${mode}\nTARGET DATE: ${date}\nLOCAL TIMEZONE: ${s.timezone}\nCURRENT UTC: ${nowIso()}\nIMPORTANT INSTRUCTION: ${instruction}\nYou can change the status of YOUR OWN existing schedules using updates [{"id":"existing id","status":"done|failed|cancelled|changed","actualText":"required only for changed"}]. Do not edit or delete original schedule text.\nYou can ONLY comment/react to the USER's existing entries. Never comment/react to your own.\nPERSONA:\n${s.agent.persona}\nUSER:\n${s.agent.userPersona}\nWORLDBOOK:\n${s.agent.worldbook}\nSPECIAL INSTRUCTIONS:\n${s.agent.instructions}\nAVAILABLE REACTIONS: ${s.reactionLibrary.join(" ")}\nELIGIBLE TARGETS FOR THIS REQUEST:\n${mode==="look_diary"?JSON.stringify(userDiaryForDate):mode==="look_schedule"?JSON.stringify(userScheduleForDate):"n/a"}\nINTERACTION JSON SCHEMA: comments use {"targetType":"schedule|diary|comment","targetId":"exact existing entry/comment id","text":"..."}. targetType "comment" means reply to an existing USER comment; reactions use {"targetType":"schedule|diary","targetId":"exact existing id","emoji":"one AVAILABLE REACTION"}.\n${uctx}\nRECENT USER ACTIVITY:\n${this.compactActivity(pending)}\nEXISTING COMMENT THREADS (do not duplicate a character reply to the same user comment):\n${JSON.stringify(this.list("comments").slice(-40))}\nYOUR SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="character").slice(-30))}\nUSER SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="user").slice(-30))}\nYOUR DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="character").slice(-7))}\nUSER DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="user").slice(-7))}\nOPTIONAL IMAGE: for YOUR OWN schedule/diary only, when an image would naturally enrich the entry and Image Generation is enabled, add "imagePrompt":"short visual prompt" to that schedule item or diary object. Do not create images for user entries.
 Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reactions":[],"summary":{"diary":"","schedule":[]},"messageNow":null}. schedule items use {"date":"${date}","time":"HH:MM or empty","end":"HH:MM or empty","text":"..."}. Comments/reactions must target existing USER entry IDs only.`;
     const base=String(profile.baseUrl||"").replace(/\/$/,"");const path=profile.path||"/chat/completions";
     const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:mode.startsWith("write_")?`Write the required ${mode==="write_schedule"?"schedule":"diary"} for ${date} now. Return a nonempty result.`:mode.startsWith("look_")?`Look at the requested user content now and MUST leave at least one valid reaction or comment on it.`:"Decide what you naturally do this visit."}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)}),response_format:{type:"json_object"}})});
@@ -554,6 +558,202 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
     this.save("fonts",this.list("fonts").filter(f=>f.id!==fid));
     return j({ok:true});
   }
+  /* ───────── Organizer：把 Uranus 里今天新增 / 更新的 Memory、Memo、Diary 整理进 Companion ───────── */
+  orgSettings(){ return {enabled:false,roleKey:"",profileId:"",intervalMinutes:60,...(this.settings().organizer||{})}; }
+  async uranus(path){
+    const b=this.settings().bridge; let origin="";
+    try{origin=new URL(String(b.url||"").trim()).origin}catch{}
+    if(!origin||!b.key)throw new Error("Fill in the Uranus address and backend key under Uranus bridge first.");
+    let lastErr=null;
+    for(let attempt=0;attempt<4;attempt++){
+      if(attempt)await new Promise(res=>setTimeout(res,attempt*1500));
+      try{
+        const r=await fetch(origin+path,{headers:{"x-uranus-key":b.key}});
+        const t=await r.text();let o=null;try{o=JSON.parse(t)}catch{}
+        if(r.ok&&o)return o;
+        const msg=`Uranus ${path.split("?")[0]} → HTTP ${r.status}${o?.error?": "+o.error:""}`;
+        lastErr=new Error(msg);
+        // 4xx (other than 429) is a real answer, not a transient restart: don't retry
+        if(r.status<500&&r.status!==429&&r.status!==0&&!/no longer active|Connection closed/i.test(t))throw lastErr;
+      }catch(e){
+        if(e===lastErr&&!/HTTP 5|HTTP 429|HTTP 0/.test(e.message))throw e;
+        lastErr=e;
+      }
+    }
+    throw lastErr||new Error("Uranus unreachable");
+  }
+  async uranusContext(date){
+    const cfg=this.orgSettings();
+    if(!cfg.roleKey)return "URANUS MEMORY: (not linked. Organizer character is not chosen in Settings, so you cannot see the chat memories. Stay vague; do not invent specifics.)";
+    try{
+      const lib=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}`);
+      const floor=this.isoPlus(date,-2);
+      const mems=(lib.memories||[]).filter(m=>String(m.content||"").trim()&&String(m.date||this.dateOfMs(Number(m.timestamp)||0))>=floor).slice(-25).map(m=>`[${m.date||this.dateOfMs(Number(m.timestamp)||0)}] ${String(m.content).trim().slice(0,500)}`);
+      const memo=String(lib.memo||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean).slice(-25).join("\n").slice(0,2500);
+      const ds=(lib.diaries||[]).filter(d=>String(d.date)>=floor).sort((a,b)=>String(a.date).localeCompare(String(b.date))||a.seq-b.seq).slice(-4);
+      const diaries=[];
+      for(const d of ds){try{const b=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}/diary/${encodeURIComponent(d.file)}`);diaries.push(`[${d.date}] ${String(b.text||"").slice(0,3000)}`);}catch{}}
+      return `URANUS MEMORY (this is what REALLY happened in the chat between you and the user, from your own memory library; it is the source of truth. Your schedule and diary MUST agree with it, continue from it, and must NOT contradict it. If something is listed in a diary's to-do list, treat it as your real plan.):
+RECENT MEMORIES:\n${mems.join("\n")||"(none)"}
+MEMO (long-term notes):\n${memo||"(none)"}
+FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
+    }catch(e){return `URANUS MEMORY: (could not be read right now: ${String(e.message||e).slice(0,120)}. Do not invent specifics; keep it minimal.)`;}
+  }
+  async organizerRoles(){
+    try{const o=await this.uranus("/api/memories");return j({ok:true,roles:(o.roles||[]).map(r=>({key:r.key,name:r.roleName,gates:r.gates}))});}
+    catch(e){return j({ok:false,error:e.message||String(e)},400);}
+  }
+  async organizerRoute(req){
+    const b=await this.body(req);
+    const r=await this.organizerRun({sinceDays:Math.max(0,Math.min(60,Number(b.sinceDays)||0))});
+    return j(r,r.ok?200:400);
+  }
+  tzName(){return this.settings().timezone||this.env.TZ||"America/New_York";}
+  dateOfMs(ms){return new Intl.DateTimeFormat("en-CA",{timeZone:this.tzName(),year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date(ms));}
+  stampOfMs(ms){
+    const p=new Intl.DateTimeFormat("en-CA",{timeZone:this.tzName(),year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(new Date(ms)).reduce((o,x)=>(o[x.type]=x.value,o),{});
+    const wd=new Intl.DateTimeFormat("en-US",{timeZone:this.tzName(),weekday:"long"}).format(new Date(ms));
+    return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} ${wd}`;
+  }
+  isoPlus(iso,n){const d=new Date(iso+"T12:00:00Z");d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);}
+  weekdayOf(iso){return new Intl.DateTimeFormat("en-US",{timeZone:"UTC",weekday:"long"}).format(new Date(iso+"T12:00:00Z"));}
+  async hash(text){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(String(text)));return [...new Uint8Array(b)].slice(0,8).map(x=>x.toString(16).padStart(2,"0")).join("");}
+  normTitle(t){return String(t||"").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu,"");}
+  async organizerRun({sinceDays=0}={}){
+    if(this.orgBusy)return {ok:false,error:"The Organizer is already running."};
+    this.orgBusy=true;
+    const cfg=this.orgSettings(),prev=this.get("org:state",{}),now=Date.now();
+    const out={ok:true,memories:0,memoLines:0,diariesSynced:0,diaryEntries:0,activities:0,skipped:0,duplicates:0,backlog:false,error:""};
+    let failed=false;
+    try{
+      if(!cfg.roleKey)throw new Error("Choose which Uranus character to read first.");
+      const s=this.settings(),today=this.localDate(),floor=this.isoPlus(today,sinceDays>0?-sinceDays:-1);
+      const seen={m:{},d:{},memo:[],...(this.get("org:seen",null)||{})};
+      const first=!this.get("org:init",false);
+      const lib=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}`);
+      const sources=[];
+      for(const m of lib.memories||[]){
+        const text=String(m.content||"").trim();if(!text)continue;
+        const h=await this.hash(text),ms=Number(m.timestamp)||now,day=m.date||this.dateOfMs(ms);
+        const old=seen.m[m.id];
+        if(old===h)continue;
+        const recent=day>=floor||this.dateOfMs(ms)>=floor;
+        if(old===undefined&&!recent){seen.m[m.id]=h;continue;}
+        sources.push({sourceId:`memory:${m.id}`,kind:"memory",recordedMs:ms,recordedDate:day,text,mark:()=>{seen.m[m.id]=h;}});
+      }
+      const memoLines=String(lib.memo||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+      const lineHashes=await Promise.all(memoLines.map(x=>this.hash(x)));
+      const seenMemo=new Set(seen.memo||[]);
+      let newLines=memoLines.map((t,i)=>({t,h:lineHashes[i]})).filter(x=>!seenMemo.has(x.h));
+      if(first&&!sinceDays){seen.memo=lineHashes;newLines=[];}
+      newLines=newLines.slice(-30);
+      if(newLines.length){
+        const text=newLines.map(x=>"- "+x.t.replace(/^[-*]\s*/,"")).join("\n");
+        sources.push({sourceId:`memo:${await this.hash(text)}`,kind:"memo",recordedMs:now,recordedDate:today,text,mark:()=>{seen.memo=[...new Set([...(seen.memo||[]),...newLines.map(x=>x.h)])];}});
+      }
+      const diaries=(lib.diaries||[]).slice().sort((a,b)=>String(b.date).localeCompare(String(a.date))||b.seq-a.seq);
+      let fetched=0;
+      for(const d of diaries){
+        const have=seen.d[d.file];
+        const needsSync=!have||have.bytes!==d.bytes;
+        if(!needsSync&&sinceDays>0&&!(d.date>=floor))continue;
+        const needsEx=d.date>=floor&&(!have||have.ex===false||have.bytes!==d.bytes||sinceDays>0);
+        if(!needsSync&&!needsEx)continue;
+        if(fetched>=12){out.backlog=true;continue;}
+        fetched++;
+        const body=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}/diary/${encodeURIComponent(d.file)}`);
+        const text=String(body.text||"");
+        const sid=`uranus:diary:${cfg.roleKey}:${d.file}`;
+        const ex=this.list("diary").find(x=>x.sourceId===sid);
+        if(ex){if(ex.text!==text)this.update("diary",ex.id,{text});}
+        else this.add("diary",{id:id("d"),owner:"character",date:d.date,title:"",kind:"diary",text,images:[],source:"uranus",sourceId:sid,seq:d.seq||1,createdAt:nowIso(),updatedAt:nowIso()});
+        out.diariesSynced++;
+        const rec={bytes:d.bytes,ex:d.date<floor};
+        seen.d[d.file]=rec;
+        if(d.date>=floor)sources.push({sourceId:`diary:${d.file}`,kind:"diary",recordedMs:new Date(d.date+"T23:30:00Z").getTime(),recordedDate:d.date,text:text.slice(0,6000),mark:()=>{rec.ex=true;}});
+      }
+      const formal=this.list("diary").filter(x=>x.source==="uranus"&&x.date>=floor);
+      out.memories=sources.filter(x=>x.kind==="memory").length;out.memoLines=newLines.length;
+      const profile=s.modelProfiles.find(x=>x.id===(cfg.profileId||s.agent.profileId));
+      const batches=[];for(let i=0;i<sources.length;i+=10)batches.push(sources.slice(i,i+10));
+      if(batches.length&&!profile)throw new Error("Choose a model for the Organizer (or a Companion model) first.");
+      if(batches.length>4)out.backlog=true;
+      for(const batch of batches.slice(0,4)){
+        let items;
+        try{items=await this.organizerModel(profile,batch,formal,today);}
+        catch(e){failed=true;out.ok=false;out.error=e.message||String(e);break;}
+        const bySid=new Map(batch.map(x=>[x.sourceId,x]));
+        for(const it of items){
+          const src=bySid.get(String(it?.sourceId||""));if(!src)continue;
+          if(it.type==="diary_entry"&&src.kind!=="diary"){
+            let text=String(it.text||"").trim();
+            if(!text||text.length>src.text.length*2+40)text=src.text;
+            const sid=`org:${src.sourceId}:${await this.hash(src.text)}`;
+            if(this.list("diary").some(x=>x.sourceId===sid)){out.duplicates++;continue;}
+            this.add("diary",{id:id("d"),owner:"character",date:src.recordedDate,title:String(it.title||"").trim().slice(0,40),kind:src.kind,text:text.slice(0,4000),images:[],source:"organizer",sourceId:sid,createdAt:new Date(src.recordedMs).toISOString(),updatedAt:nowIso()});
+            out.diaryEntries++;
+          }else if(it.type==="activity"){
+            const r=await this.organizerActivity(it,src);
+            if(r==="dup")out.duplicates++;else if(r==="skip")out.skipped++;else out.activities++;
+          }else out.skipped++;
+        }
+        batch.forEach(x=>x.mark());
+      }
+      this.put("org:seen",seen);
+      if(!failed)this.put("org:init",true);
+    }catch(e){failed=true;out.ok=false;out.error=e.message||String(e);}
+    finally{
+      this.orgBusy=false;
+      const fails=failed?(Number(prev.fails)||0)+1:0;
+      const gap=Math.max(10,Number(cfg.intervalMinutes)||60)*60000;
+      const next=failed?now+Math.min(fails+1,6)*gap:out.backlog?now+10*60000:now+gap;
+      this.put("org:state",{lastRunAt:nowIso(),ok:!failed,error:out.error,counts:{memories:out.memories,memoLines:out.memoLines,diariesSynced:out.diariesSynced,diaryEntries:out.diaryEntries,activities:out.activities,skipped:out.skipped,duplicates:out.duplicates},backlog:out.backlog,fails,nextDue:next});
+    }
+    return out;
+  }
+  async organizerModel(profile,batch,formal,today){
+    const s=this.settings();
+    const from=batch.reduce((a,x)=>x.recordedDate<a?x.recordedDate:a,today);
+    const cal=Array.from({length:30},(_,i)=>{const d=this.isoPlus(from,i);return `${d} ${this.weekdayOf(d)}`;}).join("\n");
+    const existing=this.list("schedule").filter(x=>x.owner==="character"&&(!x.date||x.date>=this.isoPlus(today,-1))&&x.status==="planned").slice(-60).map(x=>`${x.date||"undated"} | ${x.text}`).join("\n")||"(none)";
+    const formalText=formal.filter(x=>batch.some(b=>b.recordedDate===x.date)).map(x=>`[${x.date}] ${x.text.slice(0,2500)}`).join("\n---\n")||"(none)";
+    const sources=batch.map(x=>({sourceId:x.sourceId,kind:x.kind,recordedAt:this.stampOfMs(x.recordedMs),recordedDate:x.recordedDate,text:x.text.slice(0,x.kind==="diary"?6000:2500)}));
+    const system=`You are the Companion Organizer for ${s.characterName} and ${s.userName}. You read NEW records from ${s.characterName}'s own memory system and file them into a shared life journal. You are a careful clerk: NEVER invent events, feelings, people, places, times or dates that are not in the text. Keep the source's language (Chinese stays Chinese).
+Return ONLY JSON: {"items":[...]}. Each element refers to ONE source by "sourceId" and has a "type":
+- "diary_entry": ONLY for sources of kind "memory" or "memo" that read like a short personal note about something that ALREADY happened. Fields: sourceId, text (faithful restatement; same person and tense; you may tidy wording but add NO new facts; leave relative words such as "yesterday" exactly as written), title (optional, max 20 chars). Never use this for kind "diary" (formal diaries are copied verbatim by another system).
+- "activity": a concrete thing ${s.characterName} himself plans or intends to do in the FUTURE (including the to-do list at the end of a formal diary: one activity per concrete item; keep a compound task as one activity unless the parts are clearly separate). Fields: sourceId, title (short), desc (optional, one short line taken from the source), date ("YYYY-MM-DD" ONLY when the source states it or clearly implies it; resolve words like tomorrow / next Friday against THAT source's recordedAt using CALENDAR; otherwise ""), time ("HH:MM" or ""), end ("HH:MM" or ""), deadline (true only if the time is a due time), raw (the original wording of the date/time expression, or ""), confidence (0 to 1).
+- "skip": nothing worth recording, or a duplicate. Fields: sourceId, reason.
+A source may produce several items. Rules:
+1. Do not create activities for things ${s.userName} is to do, and do not turn past events into activities.
+2. If an item is already listed in EXISTING ACTIVITIES, or a memory/memo event is already covered by FORMAL DIARY of the same date, use "skip" (or omit the diary_entry).
+3. If the date is vague or unknown, leave date "" (it will stay unscheduled). Do not guess. EXCEPTION: in a source of kind "diary", the to-do / 待办 / 明日 / 接下来 list written at the END of the diary is the plan for the NEXT day: items there with no stated date get date = (the diary's recordedDate + 1 day). Items in such a list that state their own date or weekday keep that date. Only genuinely open-ended wishes ("some day", "有空时") stay "".
+4. Times are local to ${this.tzName()}.
+CALENDAR:\n${cal}\nEXISTING ACTIVITIES (date | title):\n${existing}\nFORMAL DIARY (for duplicate checking):\n${formalText}`;
+    const base=String(profile.baseUrl||"").replace(/\/$/,""),path=profile.path||"/chat/completions";
+    const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:system},{role:"user",content:`SOURCES:\n${JSON.stringify(sources)}`}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)}),response_format:{type:"json_object"}})});
+    const txt=await r.text();if(!r.ok)throw new Error(`Organizer model ${r.status}: ${txt.slice(0,240)}`);
+    let data;try{data=JSON.parse(txt);}catch{throw new Error("Organizer model returned a non-JSON envelope");}
+    let o;try{o=JSON.parse(String(data.choices?.[0]?.message?.content??data.output_text??"").replace(/^```json\s*|\s*```$/g,""));}catch{throw new Error("Organizer model did not return valid JSON");}
+    if(!Array.isArray(o.items))throw new Error("Organizer model returned no items list");
+    return o.items;
+  }
+  async organizerActivity(it,src){
+    const title=String(it.title||"").trim().slice(0,200);if(!title)return "skip";
+    const okT=v=>/^\d{2}:\d{2}$/.test(String(v||""))?String(v):"";
+    let date=/^\d{4}-\d{2}-\d{2}$/.test(String(it.date||""))?String(it.date):"";
+    if(date&&date<src.recordedDate)date="";
+    const time=date?okT(it.time):"",end=time?okT(it.end):"";
+    const key=`${date}|${this.normTitle(title)}`;
+    const same=this.list("schedule").filter(x=>x.owner==="character"&&(x.orgKey===key||this.normTitle(x.text)===this.normTitle(title)));
+    if(same.some(x=>x.orgKey===key||x.date===date))return "dup";
+    const undated=same.find(x=>!x.date&&x.origin==="organizer"&&x.status==="planned");
+    if(undated&&date){this.update("schedule",undated.id,{date,time:okT(it.time),end:okT(it.end),orgKey:key,updatedAt:nowIso()});return "ok";}
+    const x=this.newActivity({owner:"character",date,time,end,deadline:!!it.deadline,text:title,desc:it.desc});
+    Object.assign(x,{orgKey:key,origin:"organizer",sourceId:src.sourceId,rawDate:String(it.raw||"").slice(0,120),recordedAt:new Date(src.recordedMs).toISOString(),tz:this.tzName(),confidence:Math.max(0,Math.min(1,Number(it.confidence)||0))});
+    this.add("schedule",x);
+    return "ok";
+  }
+
   bridgeUrl(raw){ try{ const u=new URL(String(raw||"").trim()); if(!u.pathname||u.pathname==="/")u.pathname="/api/companion/bridge"; return u.toString(); }catch{return String(raw||"").trim();} }
   async pushBridge(type,text,meta={}){
     const s=this.settings(),b=s.bridge;
@@ -570,6 +770,7 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
   }
   async arm(){const deadline=Number(this.get("session:deadline",0))||0,next=deadline>Date.now()?Math.min(deadline,Date.now()+10*60000):Date.now()+10*60000;await this.ctx.storage.setAlarm(next)}
   async alarm(){
+    try{ const oc=this.orgSettings(); if(oc.enabled&&oc.roleKey&&Date.now()>=(Number(this.get("org:state",{}).nextDue)||0)) await this.organizerRun({}); }catch{}
     const deadline=Number(this.get("session:deadline",0))||0;if(deadline&&deadline<=Date.now()){try{await this.commitSession(new Request("https://local/api/session/commit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({representation:"original",actions:[]})}))}catch{}}
     const st=this.settings(),tz=st.timezone||this.env.TZ||"America/New_York";this.pruneActivity();
     const pp=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date()).reduce((o,x)=>(o[x.type]=x.value,o),{}),day=`${pp.year}-${pp.month}-${pp.day}`,cur=(+pp.hour)*60+(+pp.minute);
