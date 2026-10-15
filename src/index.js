@@ -750,11 +750,11 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
   async musicReact(req){
     const b=await this.body(req),song=this.cleanSong(b.song),cfg=this.musicCfg();
     if(!song.id)return j({ok:false,error:"song required"},400);
-    const line=String(b.lyricLine||"").slice(0,200),pos=Math.round(Number(b.position)||0),allowSkip=!!b.allowSkip;
-    const sys=this.musicSystem(`You are listening to "${song.name}" by ${song.artist||"unknown"}${line?`; the current lyric line is: "${line}"`:""} (at ${pos}s). React the way YOU would, briefly: one or two short sentences at most, no emojis spam. You may also decide whether you like or dislike this song (only if you really feel it; otherwise "none")${allowSkip?", and you may ask to skip it if it truly isn't for you":""}.\nReturn ONLY JSON: {"text":"your short reaction","attitude":"like|dislike|none","skip":false}`);
+    const line=String(b.lyricLine||"").slice(0,200),pos=Math.round(Number(b.position)||0),allowSkip=!!b.allowSkip;const prior=["like","dislike"].includes(b.priorAttitude)?b.priorAttitude:"";
+    const sys=this.musicSystem(`You are listening to "${song.name}" by ${song.artist||"unknown"}${line?`; the current lyric line is: "${line}"`:""} (at ${pos}s). React the way YOU would, briefly: one or two short sentences at most, no emojis spam. ${prior==="dislike"?"You already disliked this song before, so you lean strongly towards skipping it and say so. ":prior==="like"?"You already liked this song before. ":""}You may also decide whether you like or dislike this song (only if you really feel it; otherwise "none")${allowSkip?", and you may ask to skip it if it truly isn't for you":""}.\nReturn ONLY JSON: {"text":"your short reaction","attitude":"like|dislike|none","skip":false}`);
     let out;try{out=await this.callLLM(cfg,[{role:"system",content:sys},{role:"user",content:"React now."}],300)}catch(e){return j({ok:false,error:String(e.message||e)},400)}
     let o={};try{o=JSON.parse(out.replace(/^```json\s*|\s*```$/g,""))}catch{o={text:out.slice(0,200),attitude:"none"}}
-    const skip=allowSkip&&o.skip===true,text=(b.wantText===false&&!skip)?"":String(o.text||"").trim().slice(0,300),att=(b.wantAttitude!==false&&["like","dislike"].includes(o.attitude))?o.attitude:"none";
+    const skip=allowSkip&&(o.skip===true||prior==="dislike"),text=(b.wantText===false&&!skip)?"":String(o.text||"").trim().slice(0,300),att=(b.wantAttitude!==false&&["like","dislike"].includes(o.attitude))?o.attitude:"none";
     if(text)this.add("music:chat",{id:id("mc"),role:"character",text,song,at:nowIso(),kind:"react"});
     if(att!=="none")this.setAttitude(song,att,"character");
     this.save("music:chat",this.list("music:chat").slice(-80));
