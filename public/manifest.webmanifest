@@ -1,10 +1,11 @@
 {
+  "id": "/",
   "name": "Companion",
   "short_name": "Companion",
   "display": "standalone",
   "start_url": "/",
-  "background_color": "#222222",
-  "theme_color": "#222222",
+  "background_color": "#101117",
+  "theme_color": "#101117",
   "icons": [
     {
       "src": "/icon-192.png",
@@ -16,5 +17,10 @@
       "sizes": "512x512",
       "type": "image/png"
     }
+  ],
+  "scope": "/",
+  "display_override": [
+    "fullscreen",
+    "standalone"
   ]
 }

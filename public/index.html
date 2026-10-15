@@ -1,1 +1,25 @@
-<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><title>Companion</title><meta name="theme-color" content="#101117"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black"><meta name="apple-mobile-web-app-title" content="RL7"><link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png"><link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png"><link rel="manifest" href="/manifest.webmanifest"><style>html,body{margin:0;background:#101117;overflow:hidden}#root{position:fixed;left:0;top:0;right:0;bottom:0}</style></head><body><div id="root"></div><script src="/app.js"></script></body></html>
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<!-- 下面这几行运行时绝不能用脚本改：iOS 26 主屏幕 App 一改 theme-color / viewport 就退出沉浸式状态栏 -->
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover,interactive-widget=resizes-content">
+<title>Companion</title>
+<meta name="theme-color" content="#101117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="RL7">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<style>
+/* --app-h：整屏高度。浏览器里 100dvh；主屏幕 App 里 100vh/100lvh（iOS 26 下 100dvh / 100% / fixed inset:0 只到可视区，底下会空一截） */
+:root{--app-h:100vh;--app-h:100dvh}
+@media (display-mode: standalone),(display-mode: fullscreen){:root{--app-h:100vh;--app-h:100lvh}}
+html,body{margin:0;background:#101117;overflow:hidden;height:var(--app-h)}
+#root{position:fixed;left:0;right:0;top:0;height:calc(var(--app-h) + var(--adj-bottom,0px))}
+/* 状态栏色带：顶边一个实心、满宽、fixed 的盒子，iOS 26 就不在顶上画那层 Liquid Glass 模糊；
+   高度 = 状态栏 + 「顶部下移」，颜色和页面底色一致 */
+#sb-band{display:none}
+@media (display-mode: standalone),(display-mode: fullscreen){
+  #sb-band{display:block;position:fixed;top:0;left:0;right:0;height:calc(max(1px,env(safe-area-inset-top,0px)) + var(--adj-top,0px));background:#101117;z-index:10000;pointer-events:none}
+}
+</style></head><body><div id="sb-band" aria-hidden="true"></div><div id="root"></div><script src="/app.js"></script></body></html>
