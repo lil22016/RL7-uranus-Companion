@@ -878,9 +878,8 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
     if(!/^\d{4}-\d{2}-\d{2}$/.test(String(fileDate||"")))return day;
     return day<=fileDate&&day>=this.isoPlus(fileDate,-3)?day:fileDate;
   }
-  /* 一次性修正：已经按文件日期同步进来的日记挪回真正的那天；它尾部 To-do 被排到「文件日期+1」的活动，同样往前挪。 */
+  /* 每次整理先校正：已经按文件日期同步进来的日记挪回真正的那天；它尾部 To-do 被排到「文件日期+1」的活动，同样往前挪。 */
   repairDiaryDates(){
-    if(this.get("org:fix:diaryDate:v1",false))return;
     const moves=new Map();
     const diary=this.list("diary").map(x=>{
       if(x.source!=="uranus"||!x.sourceId)return x;
@@ -899,7 +898,6 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
         return {...x,date,orgKey:`${date}|${this.normTitle(x.text)}`,updatedAt:nowIso()};
       }));
     }
-    this.put("org:fix:diaryDate:v1",true);
   }
   weekdayOf(iso){return new Intl.DateTimeFormat("en-US",{timeZone:"UTC",weekday:"long"}).format(new Date(iso+"T12:00:00Z"));}
   async hash(text){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(String(text)));return [...new Uint8Array(b)].slice(0,8).map(x=>x.toString(16).padStart(2,"0")).join("");}
