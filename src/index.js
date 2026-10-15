@@ -840,7 +840,7 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
       const memo=String(lib.memo||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean).slice(-25).join("\n").slice(0,2500);
       const ds=(lib.diaries||[]).filter(d=>String(d.date)>=floor).sort((a,b)=>String(a.date).localeCompare(String(b.date))||a.seq-b.seq).slice(-4);
       const diaries=[];
-      for(const d of ds){try{const b=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}/diary/${encodeURIComponent(d.file)}`);diaries.push(`[${d.date}] ${String(b.text||"").slice(0,3000)}`);}catch{}}
+      for(const d of ds){try{const b=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}/diary/${encodeURIComponent(d.file)}`);const t=String(b.text||"");diaries.push(`[${this.diaryLivedDate(t,d.date)}] ${t.slice(0,3000)}`);}catch{}}
       return `URANUS MEMORY (this is what REALLY happened in the chat between you and the user, from your own memory library; it is the source of truth. Your schedule and diary MUST agree with it, continue from it, and must NOT contradict it. If something is listed in a diary's to-do list, treat it as your real plan.):
 RECENT MEMORIES:\n${mems.join("\n")||"(none)"}
 MEMO (long-term notes):\n${memo||"(none)"}
@@ -864,6 +864,43 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
     return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} ${wd}`;
   }
   isoPlus(iso,n){const d=new Date(iso+"T12:00:00Z");d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);}
+  /* Uranus 的成品日记文件名是「生成那一刻」的日期（2026-10-15.md），不是日记写的那一天。
+     日记顶部时间栏 = 流水里最后一条消息的时间（Uranus 提示词钉死的格式），这才是日记所属的那一天。
+     凌晨 05:00 前的时间栏算前一天（熬夜聊到过零点，仍是前一天的日记）。读不出时间栏就退回文件日期。 */
+  diaryLivedDate(text,fileDate){
+    const head=String(text||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean).slice(0,3).join("\n");
+    const m=/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?:[^\d\n]{0,12}?(\d{1,2}):(\d{2}))?/.exec(head);
+    if(!m)return fileDate;
+    const p=n=>String(n).padStart(2,"0");
+    let day=`${m[1]}-${p(m[2])}-${p(m[3])}`;
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(day)||isNaN(Date.parse(day+"T12:00:00Z")))return fileDate;
+    if(m[4]!==undefined&&Number(m[4])<5)day=this.isoPlus(day,-1);
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(String(fileDate||"")))return day;
+    return day<=fileDate&&day>=this.isoPlus(fileDate,-3)?day:fileDate;
+  }
+  /* 一次性修正：已经按文件日期同步进来的日记挪回真正的那天；它尾部 To-do 被排到「文件日期+1」的活动，同样往前挪。 */
+  repairDiaryDates(){
+    if(this.get("org:fix:diaryDate:v1",false))return;
+    const moves=new Map();
+    const diary=this.list("diary").map(x=>{
+      if(x.source!=="uranus"||!x.sourceId)return x;
+      const file=String(x.sourceId).split(":").pop(),fm=/^(\d{4}-\d{2}-\d{2})/.exec(file);if(!fm)return x;
+      const lived=this.diaryLivedDate(x.text,fm[1]);
+      if(lived===x.date)return x;
+      moves.set(`diary:${file}`,{from:x.date,to:lived});
+      return {...x,date:lived,fileDate:fm[1],updatedAt:nowIso()};
+    });
+    if(moves.size){
+      this.save("diary",diary);
+      this.save("schedule",this.list("schedule").map(x=>{
+        const mv=x.origin==="organizer"&&moves.get(String(x.sourceId||""));
+        if(!mv||!x.date||(x.status||"planned")!=="planned"||x.date!==this.isoPlus(mv.from,1))return x;
+        const date=this.isoPlus(mv.to,1);
+        return {...x,date,orgKey:`${date}|${this.normTitle(x.text)}`,updatedAt:nowIso()};
+      }));
+    }
+    this.put("org:fix:diaryDate:v1",true);
+  }
   weekdayOf(iso){return new Intl.DateTimeFormat("en-US",{timeZone:"UTC",weekday:"long"}).format(new Date(iso+"T12:00:00Z"));}
   async hash(text){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(String(text)));return [...new Uint8Array(b)].slice(0,8).map(x=>x.toString(16).padStart(2,"0")).join("");}
   normTitle(t){return String(t||"").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu,"");}
@@ -875,6 +912,7 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
     let failed=false;
     try{
       if(!cfg.roleKey)throw new Error("Choose which Uranus character to read first.");
+      this.repairDiaryDates();
       const s=this.settings(),today=this.localDate(),floor=this.isoPlus(today,sinceDays>0?-sinceDays:-1);
       const seen={m:{},d:{},memo:[],...(this.get("org:seen",null)||{})};
       const first=!this.get("org:init",false);
@@ -911,14 +949,15 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
         fetched++;
         const body=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}/diary/${encodeURIComponent(d.file)}`);
         const text=String(body.text||"");
+        const lived=this.diaryLivedDate(text,d.date);
         const sid=`uranus:diary:${cfg.roleKey}:${d.file}`;
         const ex=this.list("diary").find(x=>x.sourceId===sid);
-        if(ex){if(ex.text!==text)this.update("diary",ex.id,{text});}
-        else this.add("diary",{id:id("d"),owner:"character",date:d.date,title:"",kind:"diary",text,images:[],source:"uranus",sourceId:sid,seq:d.seq||1,createdAt:nowIso(),updatedAt:nowIso()});
+        if(ex){if(ex.text!==text||ex.date!==lived)this.update("diary",ex.id,{text,date:lived,fileDate:d.date});}
+        else this.add("diary",{id:id("d"),owner:"character",date:lived,fileDate:d.date,title:"",kind:"diary",text,images:[],source:"uranus",sourceId:sid,seq:d.seq||1,createdAt:nowIso(),updatedAt:nowIso()});
         out.diariesSynced++;
         const rec={bytes:d.bytes,ex:d.date<floor};
         seen.d[d.file]=rec;
-        if(d.date>=floor)sources.push({sourceId:`diary:${d.file}`,kind:"diary",recordedMs:new Date(d.date+"T23:30:00Z").getTime(),recordedDate:d.date,text:text.slice(0,6000),mark:()=>{rec.ex=true;}});
+        if(d.date>=floor)sources.push({sourceId:`diary:${d.file}`,kind:"diary",recordedMs:new Date(lived+"T12:00:00Z").getTime(),recordedDate:lived,text:text.slice(0,6000),mark:()=>{rec.ex=true;}});
       }
       const formal=this.list("diary").filter(x=>x.source==="uranus"&&x.date>=floor);
       out.memories=sources.filter(x=>x.kind==="memory").length;out.memoLines=newLines.length;
