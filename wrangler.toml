@@ -16,5 +16,9 @@ class_name = "Companion"
 tag = "v1"
 new_sqlite_classes = ["Companion"]
 
+# 兜底：Durable Object 的闹钟链万一断了（以前遇到过不自动整理），每 30 分钟叫醒一次接上。免费，不调模型。
+[triggers]
+crons = ["*/30 * * * *"]
+
 [vars]
 TZ = "America/New_York"

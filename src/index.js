@@ -13,7 +13,7 @@ const DEFAULTS = {
   bridge:{enabled:false,url:"",key:"",immediateReaction:"decide",maxContextChars:2800},
   image:{enabled:false,baseUrl:"",apiKey:"",model:"",positivePrompt:""},
   appearance:{my:{},loki:{},css:""},
-  organizer:{enabled:false,roleKey:"",profileId:"",intervalMinutes:60},
+  organizer:{enabled:false,roleKey:"",profileId:"",intervalMinutes:60,times:["09:00","13:00","22:30"]},
   simplifyPrompt:"You compress a Companion activity session for another AI that already knows the user and character. Minimize tokens aggressively WITHOUT losing meaningful information or temporal context.\n\nRULES:\n1. Preserve ALL meaningful facts, outcomes, status changes, emotions, relationship cues, jokes, requests, promises, concerns, and user intent. Compression must not make meaningful information disappear merely because it seems casual.\n2. Preserve TIME CONTEXT. Each source event includes its local date/time. Keep exact or concise time references whenever timing affects meaning, chronology, behavior, or how the receiving character may respond (for example: staying up late, waking early, deadlines, meals, appointments, travel, or something happening unusually late/early). For multiple events close together, you may state one shared time/range instead of repeating timestamps. Do not drop a time merely to save tokens when it changes the meaning.\n3. Merge duplicate lifecycle events about the same item (created/planned/updated/done/etc.) into one concise statement reflecting the final state while retaining meaningful changes.\n4. Merge reactions and comments aimed at the same character entry when natural.\n5. Short source wording that is already efficient may be kept verbatim, especially distinctive emotional/relationship language. Long wording may be paraphrased, but ALL meaningful semantic content must still be conveyed.\n6. Preserve short direct quotes when exact wording, humor, affection, teasing, or tone matters. Do not preserve long wording merely for style.\n7. Never invent, infer, embellish, correct, moralize, or add facts. Do not change actor, target, chronology, time, completion status, or intent.\n8. Do not summarize away details that could change how the receiving character understands or responds.\n9. Remove mechanical repetition, UI wording, redundant target text, and duplicated descriptions.\n10. Use compact plain text, usually one line per distinct semantic event. No headings, analysis, JSON, or explanatory preamble.\n11. Aim for the fewest tokens possible AFTER satisfying all preservation rules. Accuracy, semantic completeness, and relevant temporal context outrank brevity.\n\nReturn ONLY the compressed session text."
 };
 
@@ -807,7 +807,7 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
     return j({ok:true});
   }
   /* ───────── Organizer：把 Uranus 里今天新增 / 更新的 Memory、Memo、Diary 整理进 Companion ───────── */
-  orgSettings(){ return {enabled:false,roleKey:"",profileId:"",intervalMinutes:60,...(this.settings().organizer||{})}; }
+  orgSettings(){ const o={enabled:false,roleKey:"",profileId:"",intervalMinutes:60,times:["09:00","13:00","22:30"],...(this.settings().organizer||{})}; o.times=[...new Set((Array.isArray(o.times)?o.times:[]).map(String).filter(t=>/^([01]\d|2[0-3]):[0-5]\d$/.test(t)))].sort().slice(0,3); return o; }
   async uranus(path){
     const b=this.settings().bridge; let origin="";
     try{origin=new URL(String(b.url||"").trim()).origin}catch{}
@@ -853,7 +853,7 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
   }
   async organizerRoute(req){
     const b=await this.body(req);
-    const r=await this.organizerRun({sinceDays:Math.max(0,Math.min(60,Number(b.sinceDays)||0))});
+    const sd=Math.max(0,Math.min(60,Number(b.sinceDays)||0)),r=await this.organizerRun({sinceDays:sd,trigger:sd?"backfill":"manual"});
     return j(r,r.ok?200:400);
   }
   tzName(){return this.settings().timezone||this.env.TZ||"America/New_York";}
@@ -902,7 +902,64 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
   weekdayOf(iso){return new Intl.DateTimeFormat("en-US",{timeZone:"UTC",weekday:"long"}).format(new Date(iso+"T12:00:00Z"));}
   async hash(text){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(String(text)));return [...new Uint8Array(b)].slice(0,8).map(x=>x.toString(16).padStart(2,"0")).join("");}
   normTitle(t){return String(t||"").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu,"");}
-  async organizerRun({sinceDays=0}={}){
+  /* 整理的成败写进「动态」：动态就是一条时间线，角色做了什么、整理 / 读取成没成，都在这里看 */
+  orgFeed(trigger,out,failed,next){
+    const at=t=>new Intl.DateTimeFormat("zh-CN",{timeZone:this.tzName(),hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).format(new Date(t));
+    const what={manual:"手动整理",backfill:"补录",diary:"检测到新日记，自动整理",retry:"整理重试",backlog:"整理（续跑积压）",interval:"定时整理"}[trigger]||(String(trigger).startsWith("slot:")?`定时整理（${String(trigger).slice(5)}）`:"自动整理");
+    let text;
+    if(failed){
+      text=`⚠️ ${what}失败：${String(out.error||"未知错误").slice(0,200)}`+(next?` · ${at(next)} 自动重试`:"");
+    }else{
+      const bits=[];
+      if(out.diariesSynced)bits.push(`同步日记 ${out.diariesSynced} 篇${out.syncedDates?.length?`（${[...new Set(out.syncedDates)].join("、")}）`:""}`);
+      if(out.activities)bits.push(`新活动 ${out.activities}`);
+      if(out.diaryEntries)bits.push(`新短日记 ${out.diaryEntries}`);
+      if(out.memories)bits.push(`读到记忆 ${out.memories}`);
+      if(out.memoLines)bits.push(`备忘录新增 ${out.memoLines} 行`);
+      if(out.duplicates)bits.push(`重复 ${out.duplicates}`);
+      text=`✓ ${what}完成：${bits.length?bits.join(" · "):"没有新内容"}`+(out.backlog?" · 还有积压，10 分钟后继续":"");
+    }
+    this.add("notifications",{id:id("n"),kind:"system",text,read:false,createdAt:nowIso(),activityDate:this.localDate()});
+  }
+  /* 现在落在哪个定时整理点上（还没跑过的那个）。返回 {key,time} 或 null */
+  orgDueSlot(cfg){
+    if(!cfg.times.length)return null;
+    const p=new Intl.DateTimeFormat("en-CA",{timeZone:this.tzName(),year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(new Date()).reduce((o,x)=>(o[x.type]=x.value,o),{});
+    const day=`${p.year}-${p.month}-${p.day}`,cur=`${p.hour}:${p.minute}`;
+    const time=cfg.times.filter(t=>t<=cur).pop();if(!time)return null;
+    const key=`${day} ${time}`;
+    return String(this.get("org:slotDone",""))>=key?null:{key,time};
+  }
+  /* 只拉 Uranus 的日记清单（不调模型、不花 token），看有没有新的或改过的成品日记 */
+  async orgDiaryChanged(cfg){
+    const lib=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}`);
+    const seen=(this.get("org:seen",null)||{}).d||{};
+    const today=this.localDate(),floor=this.isoPlus(today,-2);
+    return (lib.diaries||[]).some(d=>String(d.date)>=floor&&(!seen[d.file]||seen[d.file].bytes!==d.bytes));
+  }
+  /* 闹钟每 10 分钟一跳：定时点 > 失败重试 / 积压 > 间隔模式 > 新日记检测 */
+  async orgTick(){
+    const cfg=this.orgSettings();
+    if(!cfg.enabled||!cfg.roleKey||this.orgBusy)return;
+    const st=this.get("org:state",{})||{},now=Date.now(),due=Number(st.nextDue)||0;
+    const slot=this.orgDueSlot(cfg);
+    if(slot){this.put("org:slotDone",slot.key);await this.organizerRun({trigger:`slot:${slot.time}`});return;}
+    if(cfg.times.length){if(due&&now>=due){await this.organizerRun({trigger:st.ok===false?"retry":"backlog"});return;}}
+    else if(now>=due){await this.organizerRun({trigger:st.ok===false?"retry":"interval"});return;}
+    if(st.ok===false)return; // 正在等重试，别再用日记检测去敲一个正在出错的 Uranus
+    const lastWatch=Number(this.get("org:watchAt",0))||0;
+    if(now-lastWatch<9*60000)return;
+    this.put("org:watchAt",now);
+    let changed=false;try{changed=await this.orgDiaryChanged(cfg);}catch{}
+    if(changed)await this.organizerRun({trigger:"diary"});
+  }
+  /* Cron 兜底（wrangler.toml 的 triggers.crons）：闹钟链万一断了，半小时内接上 */
+  async wake(){
+    const a=await this.ctx.storage.getAlarm();
+    if(!a||a<Date.now()-15*60000){await this.alarm();}
+    return {ok:true};
+  }
+  async organizerRun({sinceDays=0,trigger="auto"}={}){
     if(this.orgBusy)return {ok:false,error:"The Organizer is already running."};
     this.orgBusy=true;
     const cfg=this.orgSettings(),prev=this.get("org:state",{}),now=Date.now();
@@ -952,7 +1009,7 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
         const ex=this.list("diary").find(x=>x.sourceId===sid);
         if(ex){if(ex.text!==text||ex.date!==lived)this.update("diary",ex.id,{text,date:lived,fileDate:d.date});}
         else this.add("diary",{id:id("d"),owner:"character",date:lived,fileDate:d.date,title:"",kind:"diary",text,images:[],source:"uranus",sourceId:sid,seq:d.seq||1,createdAt:nowIso(),updatedAt:nowIso()});
-        out.diariesSynced++;
+        out.diariesSynced++;(out.syncedDates||(out.syncedDates=[])).push(lived);
         const rec={bytes:d.bytes,ex:d.date<floor};
         seen.d[d.file]=rec;
         if(d.date>=floor)sources.push({sourceId:`diary:${d.file}`,kind:"diary",recordedMs:new Date(lived+"T12:00:00Z").getTime(),recordedDate:lived,text:text.slice(0,6000),mark:()=>{rec.ex=true;}});
@@ -991,7 +1048,11 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
       this.orgBusy=false;
       const fails=failed?(Number(prev.fails)||0)+1:0;
       const gap=Math.max(10,Number(cfg.intervalMinutes)||60)*60000;
-      const next=failed?now+Math.min(fails+1,6)*gap:out.backlog?now+10*60000:now+gap;
+      // 定时模式：平时不靠 nextDue，只有失败重试（30 分钟起，最多 2 小时）和积压续跑才用
+      const next=cfg.times.length
+        ?(failed?now+Math.min(fails,4)*30*60000:out.backlog?now+10*60000:0)
+        :(failed?now+Math.min(fails+1,6)*gap:out.backlog?now+10*60000:now+gap);
+      try{this.orgFeed(trigger,out,failed,next);}catch{}
       this.put("org:state",{lastRunAt:nowIso(),ok:!failed,error:out.error,counts:{memories:out.memories,memoLines:out.memoLines,diariesSynced:out.diariesSynced,diaryEntries:out.diaryEntries,activities:out.activities,skipped:out.skipped,duplicates:out.duplicates},backlog:out.backlog,fails,nextDue:next});
     }
     return out;
@@ -1055,7 +1116,9 @@ CALENDAR:\n${cal}\nEXISTING ACTIVITIES (date | title):\n${existing}\nFORMAL DIAR
   }
   async arm(){const deadline=Number(this.get("session:deadline",0))||0,next=deadline>Date.now()?Math.min(deadline,Date.now()+10*60000):Date.now()+10*60000;await this.ctx.storage.setAlarm(next)}
   async alarm(){
-    try{ const oc=this.orgSettings(); if(oc.enabled&&oc.roleKey&&Date.now()>=(Number(this.get("org:state",{}).nextDue)||0)) await this.organizerRun({}); }catch{}
+    // 先把下一跳排上：这一跳里任何一步抛错，闹钟链都不会断（以前 arm 在最后，一抛错就再也不跳了）
+    try{await this.arm();}catch{}
+    try{ await this.orgTick(); }catch{}
     const deadline=Number(this.get("session:deadline",0))||0;if(deadline&&deadline<=Date.now()){try{await this.commitSession(new Request("https://local/api/session/commit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({representation:"original",actions:[]})}))}catch{}}
     const st=this.settings(),tz=st.timezone||this.env.TZ||"America/New_York";this.pruneActivity();
     const pp=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date()).reduce((o,x)=>(o[x.type]=x.value,o),{}),day=`${pp.year}-${pp.month}-${pp.day}`,cur=(+pp.hour)*60+(+pp.minute);
@@ -1065,4 +1128,4 @@ CALENDAR:\n${cal}\nEXISTING ACTIVITIES (date | title):\n${existing}\nFORMAL DIAR
   }
 }
 
-export default { async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")||u.pathname.startsWith("/garden/")||u.pathname==="/mcp"){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
+export default { async scheduled(_ev,env,ctx){ ctx.waitUntil(env.COMPANION.get(env.COMPANION.idFromName("main")).wake().catch(()=>{})); }, async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")||u.pathname.startsWith("/garden/")||u.pathname==="/mcp"){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
