@@ -992,11 +992,16 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
         const text=newLines.map(x=>"- "+x.t.replace(/^[-*]\s*/,"")).join("\n");
         sources.push({sourceId:`memo:${await this.hash(text)}`,kind:"memo",recordedMs:now,recordedDate:today,text,mark:()=>{seen.memo=[...new Set([...(seen.memo||[]),...newLines.map(x=>x.h)])];}});
       }
-      const diaries=(lib.diaries||[]).slice().sort((a,b)=>String(b.date).localeCompare(String(a.date))||b.seq-a.seq);
+      // 从旧到新：Uranus 改名只会把日记往更早的日期挪，从旧的处理起，每条都先搬到新名字，
+      // 它腾出来的旧名字才轮到别的日记认领（见下面按正文认回的那段）
+      const diaries=(lib.diaries||[]).slice().sort((a,b)=>String(a.date).localeCompare(String(b.date))||a.seq-b.seq);
       let fetched=0;
+      // 有以前见过的文件名不在清单里了 = Uranus 改过名。这一轮把每篇都重新对一遍正文，
+      // 不只看大小（两篇日记字节数碰巧一样时，只看大小会把改名漏掉）
+      const liveFiles=new Set(diaries.map(z=>z.file)),renamed=Object.keys(seen.d).some(f=>!liveFiles.has(f));
       for(const d of diaries){
         const have=seen.d[d.file];
-        const needsSync=!have||have.bytes!==d.bytes;
+        const needsSync=!have||have.bytes!==d.bytes||renamed;
         if(!needsSync&&sinceDays>0&&!(d.date>=floor))continue;
         const needsEx=d.date>=floor&&(!have||have.ex===false||have.bytes!==d.bytes||sinceDays>0);
         if(!needsSync&&!needsEx)continue;
@@ -1006,7 +1011,22 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
         const text=String(body.text||"");
         const lived=this.diaryLivedDate(text,d.date);
         const sid=`uranus:diary:${cfg.roleKey}:${d.file}`;
-        const ex=this.list("diary").find(x=>x.sourceId===sid);
+        let ex=this.list("diary").find(x=>x.sourceId===sid);
+        // Uranus 里改了文件名（scripts/fix-diary-dates.mjs 把按生成时刻命名的日记挪回正确日期）：
+        // 先按正文认 —— 一字不差的那条就是它，换上新文件名，评论和高亮都还挂在它身上，
+        // 也不再交给模型重新抽一遍待办（之前抽过了）。
+        // 必须先按正文、后按文件名：改名后 2026-10-16.md 这个名字原来属于 15 号那条，
+        // 按文件名先认会把 16 号的正文倒进 15 号那条、连评论一起错过去
+        const pre=`uranus:diary:${cfg.roleKey}:`;
+        const twin=this.list("diary").find(x=>x.source==="uranus"&&String(x.sourceId||"").startsWith(pre)&&x.text===text);
+        if(twin&&twin.sourceId!==sid){
+          this.update("diary",twin.id,{sourceId:sid,date:lived,fileDate:d.date});
+          seen.d[d.file]={bytes:d.bytes,ex:true};
+          out.diariesSynced++;(out.syncedDates||(out.syncedDates=[])).push(lived);
+          continue;
+        }
+        // 改名那一轮的复查：同一个文件名、正文没变、之前也抽过待办 —— 什么都不用做，别再花一次模型
+        if(renamed&&ex&&ex.text===text&&have&&have.bytes===d.bytes&&have.ex){if(ex.date!==lived)this.update("diary",ex.id,{date:lived,fileDate:d.date});continue;}
         if(ex){if(ex.text!==text||ex.date!==lived)this.update("diary",ex.id,{text,date:lived,fileDate:d.date});}
         else this.add("diary",{id:id("d"),owner:"character",date:lived,fileDate:d.date,title:"",kind:"diary",text,images:[],source:"uranus",sourceId:sid,seq:d.seq||1,createdAt:nowIso(),updatedAt:nowIso()});
         out.diariesSynced++;(out.syncedDates||(out.syncedDates=[])).push(lived);
@@ -1014,6 +1034,8 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
         seen.d[d.file]=rec;
         if(d.date>=floor)sources.push({sourceId:`diary:${d.file}`,kind:"diary",recordedMs:new Date(lived+"T12:00:00Z").getTime(),recordedDate:lived,text:text.slice(0,6000),mark:()=>{rec.ex=true;}});
       }
+      // 改名都处理完了，就把清单里已经没有的旧文件名忘掉，免得每一轮都当成「改过名」
+      if(renamed&&!out.backlog)for(const f of Object.keys(seen.d))if(!liveFiles.has(f))delete seen.d[f];
       const formal=this.list("diary").filter(x=>x.source==="uranus"&&x.date>=floor);
       out.memories=sources.filter(x=>x.kind==="memory").length;out.memoLines=newLines.length;
       const profile=s.modelProfiles.find(x=>x.id===(cfg.profileId||s.agent.profileId));
