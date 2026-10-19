@@ -96,9 +96,17 @@ export class Companion extends DurableObject {
     if(!same)return out({ok:false,error:"Bad Garden token"},401);
     try{this.tidyActivities();}catch{}
     const today=this.localDate(),from=this.isoPlus(today,-30),to=this.isoPlus(today,120);
-    const items=this.list("schedule").filter(x=>x.owner==="character"&&x.date&&x.date>=from&&x.date<=to).sort((a,b)=>String(a.date).localeCompare(String(b.date))||String(a.time||"99:99").localeCompare(String(b.time||"99:99"))).slice(-500).map(x=>{
+    const all=this.list("schedule"),byId=new Map(all.map(x=>[x.id,x]));
+    const items=all.filter(x=>x.owner==="character"&&x.date&&x.date>=from&&x.date<=to).sort((a,b)=>String(a.date).localeCompare(String(b.date))||String(a.time||"99:99").localeCompare(String(b.time||"99:99"))).slice(-500).map(x=>{
       const st=["planned","done","failed","changed","cancelled"].includes(x.status)?x.status:"planned";
-      return {id:x.id,title:String(x.text||"").slice(0,200),desc:st==="changed"?"":String(x.desc||"").slice(0,300),date:x.date,time:x.time||"",end:x.end||"",deadline:!!x.deadline,status:st,updatedAt:x.statusChangedAt||x.updatedAt||""};
+      /* what actually happened — Garden shows these in the read-only detail view */
+      const rep=x.changedTo?byId.get(x.changedTo):null;
+      return {id:x.id,title:String(x.text||"").slice(0,200),desc:String(x.desc||"").slice(0,300),date:x.date,time:x.time||"",end:x.end||"",deadline:!!x.deadline,status:st,updatedAt:x.statusChangedAt||x.updatedAt||"",
+        statusNote:st!=="planned"?String(x.statusNote||"").slice(0,400):"",
+        doneText:st==="done"?String(x.doneText||"").slice(0,300):"",
+        actualText:st==="changed"?String(x.actualText||"").slice(0,200):"",
+        changedTo:x.changedTo||"",changedToText:rep?String(rep.text||"").slice(0,200):"",changedToDate:rep?.date||"",changedToTime:rep?.time||"",
+        changedFrom:x.changedFrom||""};
     });
     return out({ok:true,characterName:this.settings().characterName||"Loki",tz:this.tzName(),now:nowIso(),items});
   }
