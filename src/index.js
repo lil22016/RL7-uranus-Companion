@@ -270,7 +270,7 @@ export class Companion extends DurableObject {
       ?`Describe this photo in one or two short factual sentences so someone who cannot see it knows what is in it (subject, setting, notable details, any visible text). No guessing about backstory.${lang?` Write in ${lang}.`:" Write in Chinese."} Return only the description.`
       :"Describe this image for memory/context in one short factual sentence. Mention only clearly visible content relevant to a diary/calendar event. No inference or backstory. Return only the sentence.";
     const v=await this.resolveVision();
-    const summary=(await this.visionCall(v,[{type:"text",text:ask},{type:"image_url",image_url:{url:data}}],purpose==="moment"?220:100)).slice(0,600);
+    const summary=(await this.visionCall(v,[{type:"text",text:ask},{type:"image_url",image_url:{url:data}}],1024)).slice(0,600);
     if(!summary)throw new Error("Empty image summary");
     this.put(`image:${iid}:meta`,{...m,summary});
     return summary;
@@ -1207,13 +1207,20 @@ CALENDAR:\n${cal}\nEXISTING ACTIVITIES (date | title):\n${existing}\nFORMAL DIAR
     if(!chk.ok)throw new Error(`当前模型「${main.label}」看不了图片。去 Companion 设置 →「识图」另选一个能识图的模型。`);
     return main;
   }
-  async visionCall(v,parts,maxTokens=200){
+  /* 思考型模型会先把 token 花在思考上：额度给太小，正文就是空的（检测时只给 20 个就踩过）。
+     所以额度给足；o 系 / GPT-5 不收 max_tokens 时改成 max_completion_tokens 再试一次；
+     正文空、只有思考内容时，opts.allowReasoning 才拿思考内容凑数（检测颜色用）。 */
+  async visionCall(v,parts,maxTokens=1024,opts={}){
     const url=/\/chat\/completions$/.test(v.baseUrl)?v.baseUrl:v.baseUrl+(v.path||"/chat/completions");
-    const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${v.apiKey||""}`,...(v.headers||{})},body:JSON.stringify({model:v.model,messages:[{role:"user",content:parts}],max_tokens:maxTokens})});
-    const raw=await r.text();if(!r.ok)throw new Error(`识图模型 HTTP ${r.status}: ${raw.slice(0,200)}`);
+    const send=async(cap)=>fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${v.apiKey||""}`,...(v.headers||{})},body:JSON.stringify({model:v.model,messages:[{role:"user",content:parts}],...cap})});
+    let r=await send({max_tokens:maxTokens}),raw=await r.text();
+    if(!r.ok&&/max_tokens/i.test(raw)){r=await send({max_completion_tokens:maxTokens});raw=await r.text();}
+    if(!r.ok)throw new Error(`识图模型 HTTP ${r.status}: ${raw.slice(0,200)}`);
     let o;try{o=JSON.parse(raw)}catch{throw new Error("识图模型返回的不是 JSON")}
-    const c=o?.choices?.[0]?.message?.content;
-    return String(Array.isArray(c)?c.map(x=>x?.text||"").join(""):(c??o?.output_text??"")).trim();
+    const msg=o?.choices?.[0]?.message||{},c=msg.content;
+    const text=String(Array.isArray(c)?c.map(x=>x?.text||"").join(""):(c??o?.output_text??"")).replace(/<think>[\s\S]*?<\/think>/gi,"").trim();
+    if(text||!opts.allowReasoning)return text;
+    return String(msg.reasoning_content||msg.reasoning||"").trim();
   }
   /* 发一张纯红色的小图，问它是什么颜色：答得出 = 能识图。结果存起来，换了模型会自动重测 */
   async checkVision(target="main"){
@@ -1221,7 +1228,7 @@ CALENDAR:\n${cal}\nEXISTING ACTIVITIES (date | title):\n${existing}\nFORMAL DIAR
     if(!v)throw new Error(target==="selected"?"还没另选识图模型。":"还没选 Companion 用的模型。");
     const png="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAUElEQVR42u3PQQkAAAgEsAthHPunMIwRfAuDFVim+rUICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICFwWs4TBD55PN2kAAAAASUVORK5CYII=";
     let ok=false,answer="",error="";
-    try{answer=(await this.visionCall(v,[{type:"text",text:"What single color fills this image? Reply with one English word only."},{type:"image_url",image_url:{url:png}}],20)).slice(0,80);ok=/red|crimson|scarlet|红/i.test(answer);if(!ok)error=`它答「${answer||"（空）"}」，说明它其实没看到图`;}
+    try{answer=(await this.visionCall(v,[{type:"text",text:"What single color fills this image? Reply with one English word only."},{type:"image_url",image_url:{url:png}}],1024,{allowReasoning:true})).slice(-200);ok=/red|crimson|scarlet|红/i.test(answer);if(!ok)error=`它答「${answer||"（空）"}」，说明它其实没看到图`;}
     catch(e){error=String(e.message||e).slice(0,240);}
     const chk={target,key:this.visionKey(v),model:v.model,label:v.label,ok,answer,error,at:nowIso()};
     this.put(target==="selected"?"vision:checkSelected":"vision:check",chk);
