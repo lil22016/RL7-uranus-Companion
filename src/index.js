@@ -36,6 +36,7 @@ export class Companion extends DurableObject {
     if(p==="/garden/feed"&&(m==="GET"||m==="OPTIONS")) return this.gardenFeed(req,u);
     if(p==="/garden/ingest"&&(m==="POST"||m==="OPTIONS")) return this.gardenIngest(req,u);
     if(p==="/mcp") return this.mcpRoute(req,u);
+    if(p.startsWith("/s/")&&m==="GET") return this.shareRoute(p,u);
     if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
     if(p==="/api/bootstrap"&&m==="GET"){ try{this.tidyActivities();}catch{} }
     if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse(),organizer:this.get("org:state",null),suggestions:this.list("suggestions"),fonts:this.list("fonts"),...this.momentsBootstrap()});
@@ -66,6 +67,8 @@ export class Companion extends DurableObject {
     if(p==="/api/font"&&m==="POST") return this.storeFont(req);
     if(p==="/api/font/link"&&m==="POST") return this.storeFontLink(req);
     if(p==="/api/uranus/providers"&&m==="GET"){ try{const c=await this.uranus("/api/config"); return j({ok:true,providers:(c.providers||[]).map(x=>({id:x.id,name:x.name,type:x.type||"custom",models:(x.models||[]).map(mm=>({model:mm.model,alias:mm.alias||"",category:mm.category||""}))}))}); }catch(e){ return j({ok:false,error:String(e.message||e)},400); } }
+    if(p==="/api/share"&&m==="POST") return this.createShare(req,u);
+    if(p==="/api/share/cover"&&m==="GET") return this.shareCover(u);
     if(p==="/api/music/state"&&m==="GET") return this.musicState();
     if(p==="/api/music/cfg"&&m==="PUT") return this.musicCfgSave(req);
     if(p==="/api/music/attitude"&&m==="POST") return this.musicAttitude(req);
@@ -238,7 +241,7 @@ export class Companion extends DurableObject {
     }
     throw new Error("Unknown tool: "+name);
   }
-  async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; let got=req.headers.get("x-companion-key")||""; if(!got&&req.method==="GET"){const u=new URL(req.url); if(u.pathname.startsWith("/api/image/")||u.pathname.startsWith("/api/font/"))got=u.searchParams.get("k")||"";} return got===secret; }
+  async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; let got=req.headers.get("x-companion-key")||""; if(!got&&req.method==="GET"){const u=new URL(req.url); if(u.pathname.startsWith("/api/image/")||u.pathname.startsWith("/api/font/")||u.pathname==="/api/share/cover")got=u.searchParams.get("k")||"";} return got===secret; }
   async body(req){ try{return await req.json();}catch{return{};} }
   async freshStart(){
     // One-time schema-aware cleanup: remove life/history/test data only. Settings are intentionally preserved.
@@ -808,6 +811,56 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
     if(reply)this.add("music:chat",{id:id("mc"),role:"character",text:reply,song,at:nowIso(),kind:"chat"});
     this.save("music:chat",this.list("music:chat").slice(-80));
     return j({ok:true,reply});
+  }
+  /* ───────── 歌词分享：一起听里勾选几句歌词 → 一张歌词卡 + 一个公开短链接 ─────────
+     /s/<id>           公开的分享页：og 标签让 iMessage 渲染成卡片；页面里嵌一段 JSON，Uranus 读链接时认它
+     /s/<id>/card.jpg  卡片图（前端画好传上来的）
+     分享页不能要密码（iMessage 是在手机上直接抓这个页面）。链接随机 10 位，页面上只有歌名和选中的几句。 */
+  shareId(){const cs="abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789",a=new Uint8Array(10);crypto.getRandomValues(a);return [...a].map(x=>cs[x%cs.length]).join("");}
+  async createShare(req,u){
+    const b=await this.body(req),song=this.cleanSong(b.song);
+    if(!song.name)return j({ok:false,error:"没有歌名"},400);
+    const lines=(Array.isArray(b.lines)?b.lines:[]).map(x=>String(x||"").trim().slice(0,200)).filter(Boolean).slice(0,12);
+    if(!lines.length)return j({ok:false,error:"至少选一句歌词"},400);
+    let imageId="";
+    if(b.image){const r=await this.storeImage(new Request("https://local/api/image",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({data:String(b.image),source:"upload",summary:`歌词卡：${song.name}`})}));const o=await r.json();if(!o.ok)return j(o,r.status);imageId=o.image.id;}
+    const sid=this.shareId(),rec={id:sid,song:{...song,album:String(b.song?.album||"").slice(0,120)},lines,imageId,createdAt:nowIso()};
+    this.put(`share:${sid}`,rec);
+    // 只留最近 300 个，太老的连图一起删
+    const ids=[...this.get("shares",[]),sid];
+    while(ids.length>300){const old=ids.shift(),r=this.get(`share:${old}`,null);if(r?.imageId){const mm=this.imageMeta(r.imageId);if(mm){for(let n=0;n<mm.chunks;n++)this.ctx.storage.kv.delete(`image:${r.imageId}:${n}`);this.ctx.storage.kv.delete(`image:${r.imageId}:meta`);}}this.ctx.storage.kv.delete(`share:${old}`);}
+    this.put("shares",ids);
+    return j({ok:true,id:sid,url:`${u.origin}/s/${sid}`});
+  }
+  /* 封面同源转一手：canvas 画跨域图会被「污染」导不出图片，所以前端经这里拿网易云的封面 */
+  async shareCover(u){
+    let src;try{src=new URL(String(u.searchParams.get("u")||""))}catch{return j({ok:false,error:"bad url"},400)}
+    if(src.protocol!=="https:"&&src.protocol!=="http:")return j({ok:false,error:"bad url"},400);
+    if(!/(^|\.)(126\.net|127\.net|163\.com)$/i.test(src.hostname))return j({ok:false,error:"只转网易云的封面"},400);
+    src.protocol="https:";
+    const r=await fetch(src.toString());if(!r.ok)return j({ok:false,error:`封面 HTTP ${r.status}`},502);
+    const type=r.headers.get("content-type")||"image/jpeg";if(!/^image\//.test(type))return j({ok:false,error:"不是图片"},502);
+    return new Response(r.body,{headers:{"content-type":type,"cache-control":"private, max-age=86400"}});
+  }
+  shareRoute(p,u){
+    const mm=/^\/s\/([A-Za-z0-9]{6,16})(\/card\.jpg)?$/.exec(p);if(!mm)return new Response("Not found",{status:404});
+    const rec=this.get(`share:${mm[1]}`,null);if(!rec)return new Response("这个分享不存在或已过期",{status:404,headers:{"content-type":"text/plain; charset=utf-8"}});
+    if(mm[2]){if(!rec.imageId)return new Response("No card",{status:404});const r=this.readImage(rec.imageId);const h=new Headers(r.headers);h.set("cache-control","public, max-age=31536000, immutable");return new Response(r.body,{status:r.status,headers:h});}
+    const e=t=>String(t||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    const s=rec.song,title=`《${s.name}》${s.artist?` — ${s.artist}`:""}`,desc=`分享了一首歌：${title}。歌词：${rec.lines.join(" / ")}`;
+    const img=rec.imageId?`${u.origin}/s/${rec.id}/card.jpg`:(s.cover||"");
+    const play=/^\d+$/.test(s.id)?`https://music.163.com/song?id=${s.id}`:"";
+    const data=JSON.stringify({v:1,kind:"song_share",song:{name:s.name,artist:s.artist,album:s.album||""},lines:rec.lines,sharedAt:rec.createdAt}).replace(/</g,"\\u003c");
+    const html=`<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>${e(title)}</title>
+<meta property="og:type" content="music.song"><meta property="og:site_name" content="Listen Together · 歌词分享">
+<meta property="og:title" content="${e(title)}"><meta property="og:description" content="${e(desc.slice(0,300))}">
+${img?`<meta property="og:image" content="${e(img)}">${rec.imageId?'<meta property="og:image:width" content="1200"><meta property="og:image:height" content="900">':""}<meta name="twitter:card" content="summary_large_image">`:""}
+<meta property="og:url" content="${e(`${u.origin}/s/${rec.id}`)}"><meta name="description" content="${e(desc.slice(0,300))}">
+<script type="application/json" id="uranus-song-share">${data}</script>
+<style>body{margin:0;min-height:100vh;background:linear-gradient(160deg,#f8f3ec,#ece2d5);color:#2d2a26;font:16px/1.6 -apple-system,"PingFang SC",sans-serif;display:flex;justify-content:center}main{width:min(560px,100%);padding:28px 18px 40px;box-sizing:border-box}img.card{width:100%;border-radius:18px;box-shadow:0 14px 40px #6b55391f;display:block}.t{font:600 22px/1.3 "Songti SC","Noto Serif SC",Georgia,serif;margin:22px 0 2px}.a{color:#8a7d70;font-size:14px}blockquote{margin:18px 0;padding:0 0 0 14px;border-left:3px solid #d9c7ad;font:18px/1.8 "Songti SC","Noto Serif SC",Georgia,serif}a.play{display:inline-block;margin-top:6px;padding:9px 16px;border-radius:999px;background:#2d2a26;color:#f8f3ec;text-decoration:none;font-size:14px}.f{margin-top:26px;font-size:12px;color:#a39686}</style></head>
+<body><main>${rec.imageId?`<img class="card" src="/s/${rec.id}/card.jpg" alt="歌词卡">`:""}<div class="t">${e(s.name)}</div><div class="a">${e(s.artist)}${s.album?` · ${e(s.album)}`:""}</div><blockquote>${rec.lines.map(e).join("<br>")}</blockquote>${play?`<a class="play" href="${e(play)}">在网易云音乐里听</a>`:""}<div class="f">♪ Listen Together</div></main></body></html>`;
+    return new Response(html,{headers:{"content-type":"text/html; charset=utf-8","cache-control":"public, max-age=300"}});
   }
   /* 字体：只存链接（不占 Companion 的存储）。.woff2/.woff/.ttf/.otf 直链，或 Google Fonts 这类 CSS 链接（要填字体名） */
   async storeFontLink(req){
@@ -1469,4 +1522,4 @@ Return ONLY JSON: {"posts":[{"ref":"exact ref","text":"...","imagePrompt":"..."}
   }
 }
 
-export default { async scheduled(_ev,env,ctx){ ctx.waitUntil(env.COMPANION.get(env.COMPANION.idFromName("main")).wake().catch(()=>{})); }, async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")||u.pathname.startsWith("/garden/")||u.pathname==="/mcp"){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
+export default { async scheduled(_ev,env,ctx){ ctx.waitUntil(env.COMPANION.get(env.COMPANION.idFromName("main")).wake().catch(()=>{})); }, async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")||u.pathname.startsWith("/garden/")||u.pathname.startsWith("/s/")||u.pathname==="/mcp"){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
