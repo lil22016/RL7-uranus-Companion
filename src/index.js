@@ -12,6 +12,10 @@ const DEFAULTS = {
   modelProfiles:[],
   bridge:{enabled:false,url:"",key:"",immediateReaction:"decide",maxContextChars:2800},
   image:{enabled:false,baseUrl:"",apiKey:"",model:"",positivePrompt:""},
+  /* 识图：auto = 用 Companion 主模型（先检测它能不能看图）；profile = 另选一个模型档案；uranus = 用 Uranus「连接」里的某个模型 */
+  vision:{source:"auto",profileId:"",uranusProviderId:"",model:""},
+  /* 朋友圈 */
+  moments:{enabled:true,fromMemory:true,autoPost:true,withImage:true,reactToUser:true,maxPerDay:2,minDelay:1,maxDelay:6},
   appearance:{my:{},loki:{},css:""},
   organizer:{enabled:false,roleKey:"",profileId:"",intervalMinutes:60,times:["09:00","13:00","22:30"]},
   simplifyPrompt:"You compress a Companion activity session for another AI that already knows the user and character. Minimize tokens aggressively WITHOUT losing meaningful information or temporal context.\n\nRULES:\n1. Preserve ALL meaningful facts, outcomes, status changes, emotions, relationship cues, jokes, requests, promises, concerns, and user intent. Compression must not make meaningful information disappear merely because it seems casual.\n2. Preserve TIME CONTEXT. Each source event includes its local date/time. Keep exact or concise time references whenever timing affects meaning, chronology, behavior, or how the receiving character may respond (for example: staying up late, waking early, deadlines, meals, appointments, travel, or something happening unusually late/early). For multiple events close together, you may state one shared time/range instead of repeating timestamps. Do not drop a time merely to save tokens when it changes the meaning.\n3. Merge duplicate lifecycle events about the same item (created/planned/updated/done/etc.) into one concise statement reflecting the final state while retaining meaningful changes.\n4. Merge reactions and comments aimed at the same character entry when natural.\n5. Short source wording that is already efficient may be kept verbatim, especially distinctive emotional/relationship language. Long wording may be paraphrased, but ALL meaningful semantic content must still be conveyed.\n6. Preserve short direct quotes when exact wording, humor, affection, teasing, or tone matters. Do not preserve long wording merely for style.\n7. Never invent, infer, embellish, correct, moralize, or add facts. Do not change actor, target, chronology, time, completion status, or intent.\n8. Do not summarize away details that could change how the receiving character understands or responds.\n9. Remove mechanical repetition, UI wording, redundant target text, and duplicated descriptions.\n10. Use compact plain text, usually one line per distinct semantic event. No headings, analysis, JSON, or explanatory preamble.\n11. Aim for the fewest tokens possible AFTER satisfying all preservation rules. Accuracy, semantic completeness, and relevant temporal context outrank brevity.\n\nReturn ONLY the compressed session text."
@@ -21,7 +25,7 @@ export class Companion extends DurableObject {
   constructor(ctx, env){ super(ctx,env); this.ctx=ctx; this.env=env; }
   get(k,d=null){ const v=this.ctx.storage.kv.get(k); return v===undefined?d:v; }
   put(k,v){ this.ctx.storage.kv.put(k,v); }
-  settings(){ return {...DEFAULTS,...this.get("settings",{}), autonomy:{...DEFAULTS.autonomy,...(this.get("settings",{}).autonomy||{})}, agent:{...DEFAULTS.agent,...(this.get("settings",{}).agent||{})}, bridge:{...DEFAULTS.bridge,...(this.get("settings",{}).bridge||{})},image:{...DEFAULTS.image,...(this.get("settings",{}).image||{})}}; }
+  settings(){ return {...DEFAULTS,...this.get("settings",{}), autonomy:{...DEFAULTS.autonomy,...(this.get("settings",{}).autonomy||{})}, agent:{...DEFAULTS.agent,...(this.get("settings",{}).agent||{})}, bridge:{...DEFAULTS.bridge,...(this.get("settings",{}).bridge||{})},image:{...DEFAULTS.image,...(this.get("settings",{}).image||{})},vision:{...DEFAULTS.vision,...(this.get("settings",{}).vision||{})},moments:{...DEFAULTS.moments,...(this.get("settings",{}).moments||{})}}; }
   list(kind){ return this.get(`list:${kind}`,[]); }
   save(kind, arr){ this.put(`list:${kind}`,arr); }
   add(kind, item){ const arr=this.list(kind); arr.push(item); this.save(kind,arr); return item; }
@@ -34,7 +38,8 @@ export class Companion extends DurableObject {
     if(p==="/mcp") return this.mcpRoute(req,u);
     if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
     if(p==="/api/bootstrap"&&m==="GET"){ try{this.tidyActivities();}catch{} }
-    if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse(),organizer:this.get("org:state",null),suggestions:this.list("suggestions"),fonts:this.list("fonts")});
+    if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse(),organizer:this.get("org:state",null),suggestions:this.list("suggestions"),fonts:this.list("fonts"),...this.momentsBootstrap()});
+    if(p.startsWith("/api/moments")||p.startsWith("/api/vision/")){ const r=await this.momentsRoute(req,p,m); if(r)return r; }
     if(p==="/api/settings"&&m==="PUT") return this.setSettings(req);
     if(p==="/api/garden/info"&&m==="GET") return j({ok:true,token:String(this.settings().garden?.token||""),url:u.origin});
     if(p==="/api/garden/token"&&m==="POST"){ const a=new Uint8Array(24); crypto.getRandomValues(a); const token=[...a].map(x=>x.toString(16).padStart(2,"0")).join(""); this.put("settings",{...this.settings(),garden:{token,createdAt:nowIso()}}); return j({ok:true,token,url:u.origin}); }
@@ -238,7 +243,8 @@ export class Companion extends DurableObject {
   async freshStart(){
     // One-time schema-aware cleanup: remove life/history/test data only. Settings are intentionally preserved.
     const cleared={};
-    for(const kind of ["schedule","diary","comments","reactions","highlights","notifications","suggestions"]){
+    this.put("moments:jobs",[]);
+    for(const kind of ["schedule","diary","comments","reactions","highlights","notifications","suggestions","moments","momentLikes","momentComments"]){
       cleared[kind]=this.list(kind).length;
       this.save(kind,[]);
     }
@@ -253,9 +259,23 @@ export class Companion extends DurableObject {
   imageMeta(i){return this.get(`image:${i}:meta`,null)}
   async storeImage(req){const b=await this.body(req),data=String(b.data||"");if(!/^data:image\/(jpeg|png|webp);base64,/i.test(data))return j({ok:false,error:"Image data required"},400);if(data.length>900000)return j({ok:false,error:"Image too large after compression"},413);const iid=id("img"),chunks=[];for(let n=0;n<data.length;n+=80000)chunks.push(data.slice(n,n+80000));chunks.forEach((x,n)=>this.put(`image:${iid}:${n}`,x));const meta={id:iid,chunks:chunks.length,summary:String(b.summary||"").slice(0,600),source:b.source==="generated"?"generated":"upload",createdAt:nowIso()};this.put(`image:${iid}:meta`,meta);return j({ok:true,image:{...meta,url:`/api/image/${iid}`}})}
   readImage(i){const m=this.imageMeta(i);if(!m)return j({ok:false,error:"Image not found"},404);let data="";for(let n=0;n<m.chunks;n++)data+=this.get(`image:${i}:${n}`,"");const mm=data.match(/^data:(image\/[^;]+);base64,(.*)$/s);if(!mm)return j({ok:false,error:"Invalid stored image"},500);const bin=Uint8Array.from(atob(mm[2]),c=>c.charCodeAt(0));return new Response(bin,{headers:{"content-type":mm[1],"cache-control":"private, max-age=31536000"}})}
-  deleteImage(i){const m=this.imageMeta(i);if(m){for(let n=0;n<m.chunks;n++)this.ctx.storage.kv.delete(`image:${i}:${n}`);this.ctx.storage.kv.delete(`image:${i}:meta`)}for(const k of ["schedule","diary"])this.save(k,this.list(k).map(x=>({...x,images:(x.images||[]).filter(q=>q.id!==i),statusImages:(x.statusImages||[]).filter(q=>q.id!==i)})));return j({ok:true})}
+  deleteImage(i){const m=this.imageMeta(i);if(m){for(let n=0;n<m.chunks;n++)this.ctx.storage.kv.delete(`image:${i}:${n}`);this.ctx.storage.kv.delete(`image:${i}:meta`)}for(const k of ["schedule","diary"])this.save(k,this.list(k).map(x=>({...x,images:(x.images||[]).filter(q=>q.id!==i),statusImages:(x.statusImages||[]).filter(q=>q.id!==i)})));this.save("moments",this.list("moments").map(x=>({...x,images:(x.images||[]).filter(q=>q.id!==i)})));return j({ok:true})}
   async generateImage(req){const b=await this.body(req),cfg0=this.settings().image,cfg={...cfg0};if(cfg0.source==="uranus"&&cfg0.uranusProviderId){try{const rp=await this.resolveUranusProvider(cfg0.uranusProviderId);cfg.baseUrl=rp.baseUrl;cfg.apiKey=rp.apiKey}catch(e){return j({ok:false,error:String(e.message||e)},400)}}if(!cfg.enabled||!cfg.baseUrl||!cfg.model)return j({ok:false,error:"Configure Image Generation first"},400);const prompt=[cfg.positivePrompt,String(b.prompt||"")].map(x=>String(x||"").trim()).filter(Boolean).join("\n");if(!prompt)return j({ok:false,error:"Image prompt required"},400);let url=String(cfg.baseUrl).replace(/\/+$/,"");if(!url.endsWith("/images/generations"))url+="/images/generations";const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${cfg.apiKey||""}`},body:JSON.stringify({model:cfg.model,prompt,n:1,size:"1024x1024",response_format:"b64_json"})});const raw=await r.text();if(!r.ok)throw new Error(`Image API ${r.status}: ${raw.slice(0,300)}`);let o;try{o=JSON.parse(raw)}catch{throw new Error("Image API returned invalid JSON")}const it=o?.data?.[0];let data=it?.b64_json?`data:image/png;base64,${it.b64_json}`:"";if(!data&&it?.url){const rr=await fetch(it.url);const buf=new Uint8Array(await rr.arrayBuffer());let str="";for(let n=0;n<buf.length;n+=8192)str+=String.fromCharCode(...buf.slice(n,n+8192));data=`data:${rr.headers.get("content-type")||"image/png"};base64,${btoa(str)}`}if(!data)throw new Error("Image API returned no image");return this.storeImage(new Request("https://local/api/image",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({data,source:"generated"})}))}
-  async summarizeImage(req){const b=await this.body(req),iid=String(b.imageId||""),m=this.imageMeta(iid);if(!m)return j({ok:false,error:"Image not found"},404);let data="";for(let n=0;n<m.chunks;n++)data+=this.get(`image:${iid}:${n}`,"");const st=this.settings(),p=st.modelProfiles.find(x=>x.id===st.agent.profileId);if(!p)return j({ok:false,error:"Select an active Companion model"},400);const base=String(p.baseUrl||"").replace(/\/+$/,""),url=base.endsWith("/chat/completions")?base:base+"/chat/completions";const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${p.apiKey||""}`,...(p.headers||{})},body:JSON.stringify({model:p.model,messages:[{role:"user",content:[{type:"text",text:"Describe this image for memory/context in one short factual sentence. Mention only clearly visible content relevant to a diary/calendar event. No inference or backstory. Return only the sentence."},{type:"image_url",image_url:{url:data}}]}],max_tokens:100})});const raw=await r.text();if(!r.ok)throw new Error(`Vision summary ${r.status}: ${raw.slice(0,240)}`);let o;try{o=JSON.parse(raw)}catch{throw new Error("Vision model returned invalid JSON")}const summary=String(o?.choices?.[0]?.message?.content||"").trim().slice(0,600);if(!summary)throw new Error("Empty image summary");this.put(`image:${iid}:meta`,{...m,summary});return j({ok:true,summary})}
+  imageData(iid){const m=this.imageMeta(iid);if(!m)return "";let data="";for(let n=0;n<m.chunks;n++)data+=this.get(`image:${iid}:${n}`,"");return data;}
+  /* 识图走 resolveVision()：设置里选了专门的识图模型就用它；没选就用 Companion 主模型（先检测过它能看图） */
+  async describeImage(iid,purpose=""){
+    const m=this.imageMeta(iid);if(!m)throw new Error("Image not found");
+    const data=this.imageData(iid),lang=String(this.settings().agent.language||"").trim();
+    const ask=purpose==="moment"
+      ?`Describe this photo in one or two short factual sentences so someone who cannot see it knows what is in it (subject, setting, notable details, any visible text). No guessing about backstory.${lang?` Write in ${lang}.`:" Write in Chinese."} Return only the description.`
+      :"Describe this image for memory/context in one short factual sentence. Mention only clearly visible content relevant to a diary/calendar event. No inference or backstory. Return only the sentence.";
+    const v=await this.resolveVision();
+    const summary=(await this.visionCall(v,[{type:"text",text:ask},{type:"image_url",image_url:{url:data}}],purpose==="moment"?220:100)).slice(0,600);
+    if(!summary)throw new Error("Empty image summary");
+    this.put(`image:${iid}:meta`,{...m,summary});
+    return summary;
+  }
+  async summarizeImage(req){const b=await this.body(req),iid=String(b.imageId||"");if(!this.imageMeta(iid))return j({ok:false,error:"Image not found"},404);try{return j({ok:true,summary:await this.describeImage(iid,b.purpose)})}catch(e){return j({ok:false,error:String(e.message||e)},400)}}
   imageContext(x){const z=(x.images||[]).map(q=>q.summary||this.imageMeta(q.id)?.summary).filter(Boolean);return z.length?` Image: ${z.join("; ")}`:""}
   queueCharacter(text){const q=this.get("pending:character",[]);q.push({id:crypto.randomUUID(),text:String(text).slice(0,1600),createdAt:nowIso()});this.put("pending:character",q.slice(-100))}
   async flushCharacterContext(reason="scheduled"){const q=this.get("pending:character",[]);if(!q.length)return j({ok:true,empty:true});const packet=q.map(x=>`[${this.formatSessionTime(x.createdAt)}] ${x.text}`).join("\n"),packetId=crypto.randomUUID();this.add("notifications",{id:id("n"),text:"Character context syncing to Uranus…",read:false,createdAt:nowIso(),activityDate:this.localDate()});const r=await this.pushBridge("character_life",packet,{actor:"character",source:"companion",origin:`character_context_${reason}`,packetId});if(r.ok&&r.accepted){this.put("pending:character",[]);this.add("notifications",{id:id("n"),text:`Character context synced to Uranus · ${reason}.`,read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:true,accepted:true})}this.add("notifications",{id:id("n"),text:"Character context sync failed · retained for retry.",read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:false,error:r.error||"No ACK"},502)}
@@ -385,7 +405,7 @@ export class Companion extends DurableObject {
     if(!diary||diary.owner!=="character")return j({ok:false,error:"Only the character's diary can be highlighted"},403);
     const x={id:id("h"),actor:"user",diaryId:diary.id,text:String(b.text||""),start:Number(b.start)||0,end:Number(b.end)||0,createdAt:nowIso()};
     if(!x.text)return j({ok:false,error:"Text required"},400);this.add("highlights",x);return j({ok:true,item:x}); }
-  meaningfulActions(actions){ return (Array.isArray(actions)?actions:[]).filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule","suggestion_accept","suggestion_reject"].includes(x?.type)); }
+  meaningfulActions(actions){ return (Array.isArray(actions)?actions:[]).filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule","suggestion_accept","suggestion_reject","moment_post","moment_comment","moment_like"].includes(x?.type)); }
   async touchSession(req){
     const b=await this.body(req), meaningful=this.meaningfulActions(b.actions);
     if(!meaningful.length)return j({ok:true,empty:true,pending:this.get("session:pending",[]).length});
@@ -515,6 +535,10 @@ export class Companion extends DurableObject {
       if(a.type==="write_diary")return `${t}${String(a.summary||"").slice(0,700)}`;
       if(a.type==="update_schedule")return `${t}Raylee updated a plan: ${String(a.summary||"").slice(0,300)}.`;
       if(a.type==="suggestion_accept")return `${t}Raylee accepted ${this.settings().characterName}'s suggestion for My Day: ${String(a.summary||"").slice(0,300)}.`;
+      const un=this.settings().userName,cn=this.settings().characterName;
+      if(a.type==="moment_post")return `${t}${un} posted on her Moments (朋友圈): “${String(a.text||"").slice(0,300)}”${a.photos?` [photos: ${String(a.photos).slice(0,400)}]`:""}.`;
+      if(a.type==="moment_comment")return `${t}${un} commented on ${a.owner==="character"?`${cn}'s`:"her own"} Moments post “${String(a.targetText||"").slice(0,100)}”${a.replyTo?` (replying to ${cn}: “${String(a.replyTo).slice(0,100)}”)`:""}: “${String(a.text||"").slice(0,200)}”.`;
+      if(a.type==="moment_like")return `${t}${un} liked ${cn}'s Moments post “${String(a.targetText||"").slice(0,120)}”.`;
       if(a.type==="suggestion_reject")return `${t}Raylee rejected ${this.settings().characterName}'s suggestion for My Day (${String(a.summary||"").slice(0,300)}). Her original plan stays as it was.`;
       return `${t}${String(a.summary||a.type)}`;
     }).join("\n");
@@ -929,6 +953,7 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
       if(out.memories)bits.push(`读到记忆 ${out.memories}`);
       if(out.memoLines)bits.push(`备忘录新增 ${out.memoLines} 行`);
       if(out.duplicates)bits.push(`重复 ${out.duplicates}`);
+      if(out.moments)bits.push(`发了朋友圈 ${out.moments}`);
       text=`✓ ${what}完成：${bits.length?bits.join(" · "):"没有新内容"}`+(out.backlog?" · 还有积压，10 分钟后继续":"");
     }
     this.add("notifications",{id:id("n"),kind:"system",text,read:false,createdAt:nowIso(),activityDate:this.localDate()});
@@ -1077,6 +1102,12 @@ FORMAL DIARIES (latest):\n${diaries.join("\n---\n")||"(none)"}`;
       }
       this.put("org:seen",seen);
       if(!failed)this.put("org:init",true);
+      // 朋友圈：这一轮新读到的记忆 / 日记里，挑适合发出去的（补录不发，免得一次冒出一堆旧事）
+      const ms=this.settings().moments;
+      if(!failed&&trigger!=="backfill"&&ms.enabled&&ms.fromMemory){
+        const cands=sources.filter(x=>(x.kind==="memory"||x.kind==="diary")&&x.recordedDate>=this.isoPlus(today,-1));
+        if(cands.length){try{out.moments=await this.momentsFromSources(cands,{});}catch(e){this.add("notifications",{id:id("n"),kind:"system",text:`⚠️ 从记忆挑朋友圈失败：${String(e.message||e).slice(0,160)}`,read:false,createdAt:nowIso(),activityDate:this.localDate()});}}
+      }
     }catch(e){failed=true;out.ok=false;out.error=e.message||String(e);}
     finally{
       this.orgBusy=false;
@@ -1134,6 +1165,274 @@ CALENDAR:\n${cal}\nEXISTING ACTIVITIES (date | title):\n${existing}\nFORMAL DIAR
     return "ok";
   }
 
+  /* ───────── 朋友圈 ─────────
+     moments        帖子 {id, owner:"user"|"character", text, images:[{id,summary}], source, sourceRef, createdAt}
+     momentLikes    {id, momentId, actor, createdAt}
+     momentComments {id, momentId, actor, text, replyTo(评论 id 或 null), createdAt}
+     moments:jobs   角色稍后要做的事（看你的新帖 / 回你的评论），闹钟到点执行 —— 不立刻回，像真人刷到了才回 */
+  momentsBootstrap(){
+    const moments=this.list("moments").slice(-150),ids=new Set(moments.map(x=>x.id));
+    return {moments,momentLikes:this.list("momentLikes").filter(x=>ids.has(x.momentId)),momentComments:this.list("momentComments").filter(x=>ids.has(x.momentId)),momentJobs:this.get("moments:jobs",[]).map(x=>({type:x.type,momentId:x.momentId,commentId:x.commentId||null,dueAt:x.dueAt})),visionCheck:this.get("vision:check",null),visionCheckSelected:this.get("vision:checkSelected",null)};
+  }
+  momentsToday(owner){const d=this.localDate();return this.list("moments").filter(x=>(!owner||x.owner===owner)&&this.dateOfMs(Date.parse(x.createdAt)||0)===d).length;}
+  async momentsRoute(req,p,m){
+    let mm;
+    if(p==="/api/vision/check"&&m==="POST"){const b=await this.body(req);try{return j({ok:true,check:await this.checkVision(b.target==="selected"?"selected":"main")})}catch(e){return j({ok:false,error:String(e.message||e)},400)}}
+    if(p==="/api/moments"&&m==="POST")return this.createUserMoment(req);
+    if(p==="/api/moments/compose"&&m==="POST"){const b=await this.body(req);try{const x=await this.composeMoment({source:"manual",hint:String(b.hint||"").slice(0,300)});return x?j({ok:true,moment:x}):j({ok:false,error:`${this.settings().characterName} 这次不想发。`},400)}catch(e){return j({ok:false,error:String(e.message||e)},400)}}
+    if(p==="/api/moments/from-memory"&&m==="POST"){try{const n=await this.momentsFromUranus();return n?j({ok:true,made:n}):j({ok:false,error:"最近的记忆里没有适合发朋友圈的（或都发过了）。"},400)}catch(e){return j({ok:false,error:String(e.message||e)},400)}}
+    if((mm=/^\/api\/moments\/comment\/([^/]+)$/.exec(p))&&m==="DELETE")return this.deleteMomentComment(mm[1]);
+    if((mm=/^\/api\/moments\/([^/]+)\/like$/.exec(p))&&m==="POST")return this.toggleMomentLike(mm[1]);
+    if((mm=/^\/api\/moments\/([^/]+)\/comment$/.exec(p))&&m==="POST")return this.addUserMomentComment(mm[1],req);
+    if((mm=/^\/api\/moments\/([^/]+)\/look$/.exec(p))&&m==="POST"){const x=this.list("moments").find(z=>z.id===mm[1]);if(!x)return j({ok:false,error:"Not found"},404);if(x.owner!=="user")return j({ok:false,error:"只能让 TA 看你发的"},400);this.save("moments:jobs",this.get("moments:jobs",[]).filter(z=>!(z.type==="react"&&z.momentId===x.id)));try{const r=await this.reactToUserMoment(x,{force:true});return j({ok:true,...r})}catch(e){return j({ok:false,error:String(e.message||e)},400)}}
+    if((mm=/^\/api\/moments\/([^/]+)$/.exec(p))&&m==="DELETE")return this.deleteMoment(mm[1]);
+    return null;
+  }
+
+  /* ── 识图 ── */
+  visionKey(v){return `${v.baseUrl}|${v.model}`;}
+  mainVisionModel(){const s=this.settings(),p=s.modelProfiles.find(x=>x.id===s.agent.profileId);if(!p)return null;return {label:p.name||p.model,baseUrl:String(p.baseUrl||"").replace(/\/+$/,""),path:p.path||"/chat/completions",apiKey:p.apiKey||"",model:p.model,headers:p.headers||{}};}
+  async selectedVisionModel(){
+    const v=this.settings().vision,s=this.settings();
+    if(v.source==="profile"&&v.profileId){const p=s.modelProfiles.find(x=>x.id===v.profileId);if(!p)throw new Error("设置里选的识图模型不存在了，请重新选一个。");return {label:p.name||p.model,baseUrl:String(p.baseUrl||"").replace(/\/+$/,""),path:p.path||"/chat/completions",apiKey:p.apiKey||"",model:p.model,headers:p.headers||{}};}
+    if(v.source==="uranus"&&v.uranusProviderId){if(!v.model)throw new Error("识图：选了 Uranus 连接，但还没选模型。");const rp=await this.resolveUranusProvider(v.uranusProviderId);return {label:v.model,baseUrl:rp.baseUrl,path:"/chat/completions",apiKey:rp.apiKey,model:v.model,headers:{}};}
+    return null;
+  }
+  async resolveVision(){
+    const sel=await this.selectedVisionModel();if(sel)return sel;
+    const main=this.mainVisionModel();
+    if(!main)throw new Error("还没选 Companion 用的模型，没法识图。");
+    let chk=this.get("vision:check",null);
+    if(!chk||chk.target!=="main"||chk.key!==this.visionKey(main))chk=await this.checkVision("main");
+    if(!chk.ok)throw new Error(`当前模型「${main.label}」看不了图片。去 Companion 设置 →「识图」另选一个能识图的模型。`);
+    return main;
+  }
+  async visionCall(v,parts,maxTokens=200){
+    const url=/\/chat\/completions$/.test(v.baseUrl)?v.baseUrl:v.baseUrl+(v.path||"/chat/completions");
+    const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${v.apiKey||""}`,...(v.headers||{})},body:JSON.stringify({model:v.model,messages:[{role:"user",content:parts}],max_tokens:maxTokens})});
+    const raw=await r.text();if(!r.ok)throw new Error(`识图模型 HTTP ${r.status}: ${raw.slice(0,200)}`);
+    let o;try{o=JSON.parse(raw)}catch{throw new Error("识图模型返回的不是 JSON")}
+    const c=o?.choices?.[0]?.message?.content;
+    return String(Array.isArray(c)?c.map(x=>x?.text||"").join(""):(c??o?.output_text??"")).trim();
+  }
+  /* 发一张纯红色的小图，问它是什么颜色：答得出 = 能识图。结果存起来，换了模型会自动重测 */
+  async checkVision(target="main"){
+    const v=target==="selected"?await this.selectedVisionModel():this.mainVisionModel();
+    if(!v)throw new Error(target==="selected"?"还没另选识图模型。":"还没选 Companion 用的模型。");
+    const png="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAUElEQVR42u3PQQkAAAgEsAthHPunMIwRfAuDFVim+rUICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICFwWs4TBD55PN2kAAAAASUVORK5CYII=";
+    let ok=false,answer="",error="";
+    try{answer=(await this.visionCall(v,[{type:"text",text:"What single color fills this image? Reply with one English word only."},{type:"image_url",image_url:{url:png}}],20)).slice(0,80);ok=/red|crimson|scarlet|红/i.test(answer);if(!ok)error=`它答「${answer||"（空）"}」，说明它其实没看到图`;}
+    catch(e){error=String(e.message||e).slice(0,240);}
+    const chk={target,key:this.visionKey(v),model:v.model,label:v.label,ok,answer,error,at:nowIso()};
+    this.put(target==="selected"?"vision:checkSelected":"vision:check",chk);
+    return chk;
+  }
+
+  /* ── 工具 ── */
+  loose(text){const t=String(text||"").replace(/^```\w*\s*|\s*```$/g,"").trim();try{return JSON.parse(t)}catch{}const a=t.indexOf("{"),b=t.lastIndexOf("}");if(a>=0&&b>a){try{return JSON.parse(t.slice(a,b+1))}catch{}}return null;}
+  momentPersona(){
+    const s=this.settings(),lang=String(s.agent.language||"").trim();
+    return `${lang?`OUTPUT LANGUAGE (highest priority): write every human-readable text in ${lang}.\n`:""}You are ${s.characterName}. ${s.userName} is the user. You both use a private "Moments" feed (like WeChat 朋友圈): short posts, maybe with photos; people like and comment.
+PERSONA:\n${String(s.agent.persona||"").slice(0,3000)||"(none)"}
+USER (${s.userName}):\n${String(s.agent.userPersona||"").slice(0,1500)||"(none)"}
+WORLDBOOK:\n${String(s.agent.worldbook||"").slice(0,1500)||"(none)"}
+SPECIAL INSTRUCTIONS:\n${String(s.agent.instructions||"").slice(0,800)}`;
+  }
+  momentText(x){
+    const s=this.settings(),who=a=>a==="character"?s.characterName:s.userName;
+    const pics=(x.images||[]).map(q=>q.summary||this.imageMeta(q.id)?.summary||"").filter(Boolean);
+    const likes=this.list("momentLikes").filter(l=>l.momentId===x.id).map(l=>who(l.actor));
+    const cms=this.list("momentComments").filter(c=>c.momentId===x.id).map(c=>{const to=c.replyTo&&this.list("momentComments").find(z=>z.id===c.replyTo);return `  [${c.id}] ${who(c.actor)}${to?` → ${who(to.actor)}`:""}: ${c.text}`;});
+    return `[${x.id}] ${who(x.owner)} · ${this.stampOfMs(Date.parse(x.createdAt)||Date.now())}\n“${x.text||""}”${pics.length?`\nPhotos: ${pics.map((d,i)=>`(${i+1}) ${d}`).join(" ")}`:x.images?.length?`\nPhotos: ${x.images.length} (could not be described)`:""}${likes.length?`\nLikes: ${likes.join(", ")}`:""}${cms.length?`\nComments:\n${cms.join("\n")}`:""}`;
+  }
+
+  /* ── 稍后执行的事 ── */
+  nextMomentJobAt(){const q=this.get("moments:jobs",[]);return q.length?Math.min(...q.map(x=>Number(x.dueAt)||0)):0;}
+  async queueMomentJob(job){
+    const ms=this.settings().moments,lo=Math.max(0,Number(ms.minDelay)||0),hi=Math.max(lo,Number(ms.maxDelay)||0);
+    const dueAt=Date.now()+Math.round((lo+Math.random()*(hi-lo))*60000);
+    const q=this.get("moments:jobs",[]).filter(x=>!(x.type===job.type&&x.momentId===job.momentId&&(x.commentId||null)===(job.commentId||null)));
+    q.push({...job,id:crypto.randomUUID(),dueAt,tries:0});this.put("moments:jobs",q.slice(-40));
+    const cur=await this.ctx.storage.getAlarm();if(!cur||cur>dueAt)await this.ctx.storage.setAlarm(Math.max(dueAt,Date.now()+1000));
+  }
+  async runMomentJobs(){
+    if(this.momentBusy)return;this.momentBusy=true;
+    try{
+      const now=Date.now();let q=this.get("moments:jobs",[]);
+      const due=q.filter(x=>(Number(x.dueAt)||0)<=now).slice(0,3);
+      for(const job of due){
+        q=this.get("moments:jobs",[]).filter(x=>x.id!==job.id);this.put("moments:jobs",q);
+        const mo=this.list("moments").find(x=>x.id===job.momentId);if(!mo)continue;
+        try{
+          if(job.type==="react")await this.reactToUserMoment(mo,{});
+          else if(job.type==="reply"){const c=this.list("momentComments").find(x=>x.id===job.commentId);if(c)await this.replyToMomentComment(mo,c);}
+        }catch(e){
+          // 模型偶尔抽风：最多重试两次，隔 10 分钟
+          if((job.tries||0)<2){const qq=this.get("moments:jobs",[]);qq.push({...job,tries:(job.tries||0)+1,dueAt:Date.now()+10*60000});this.put("moments:jobs",qq);}
+          else this.add("notifications",{id:id("n"),kind:"system",text:`⚠️ 朋友圈：${this.settings().characterName} 没能回应（${String(e.message||e).slice(0,140)}）`,read:false,createdAt:nowIso(),activityDate:this.localDate()});
+        }
+      }
+    }finally{this.momentBusy=false;}
+  }
+
+  /* ── 你发的 ── */
+  async createUserMoment(req){
+    const b=await this.body(req),text=String(b.text||"").trim().slice(0,2000);
+    const images=(Array.isArray(b.images)?b.images:[]).filter(x=>x&&this.imageMeta(String(x.id||""))).slice(0,9).map(x=>({id:String(x.id),summary:String(x.summary||this.imageMeta(String(x.id))?.summary||"").slice(0,600)}));
+    if(!text&&!images.length)return j({ok:false,error:"写点什么或者放张图"},400);
+    const x={id:id("m"),owner:"user",text,images,source:"user",createdAt:nowIso(),updatedAt:nowIso()};
+    this.add("moments",x);
+    await this.queueSession([{type:"moment_post",text,photos:images.map(q=>q.summary).filter(Boolean).join("; ")}]);
+    if(this.settings().moments.reactToUser)await this.queueMomentJob({type:"react",momentId:x.id});
+    return j({ok:true,moment:x});
+  }
+  async deleteMoment(mid){
+    const x=this.list("moments").find(z=>z.id===mid);if(!x)return j({ok:false,error:"Not found"},404);
+    this.save("moments",this.list("moments").filter(z=>z.id!==mid));
+    this.save("momentLikes",this.list("momentLikes").filter(z=>z.momentId!==mid));
+    this.save("momentComments",this.list("momentComments").filter(z=>z.momentId!==mid));
+    this.put("moments:jobs",this.get("moments:jobs",[]).filter(z=>z.momentId!==mid));
+    for(const im of x.images||[]){const meta=this.imageMeta(im.id);if(meta){for(let n=0;n<meta.chunks;n++)this.ctx.storage.kv.delete(`image:${im.id}:${n}`);this.ctx.storage.kv.delete(`image:${im.id}:meta`);}}
+    return j({ok:true});
+  }
+  async toggleMomentLike(mid){
+    const x=this.list("moments").find(z=>z.id===mid);if(!x)return j({ok:false,error:"Not found"},404);
+    const arr=this.list("momentLikes"),had=arr.find(l=>l.momentId===mid&&l.actor==="user");
+    if(had){this.save("momentLikes",arr.filter(l=>l.id!==had.id));return j({ok:true,liked:false});}
+    arr.push({id:id("ml"),momentId:mid,actor:"user",createdAt:nowIso()});this.save("momentLikes",arr);
+    if(x.owner==="character")await this.queueSession([{type:"moment_like",targetText:x.text||"(photo)"}]);
+    return j({ok:true,liked:true});
+  }
+  async addUserMomentComment(mid,req){
+    const x=this.list("moments").find(z=>z.id===mid);if(!x)return j({ok:false,error:"Not found"},404);
+    const b=await this.body(req),text=String(b.text||"").trim().slice(0,500);if(!text)return j({ok:false,error:"写点什么"},400);
+    const to=b.replyTo?this.list("momentComments").find(c=>c.id===b.replyTo&&c.momentId===mid):null;
+    const c={id:id("mc"),momentId:mid,actor:"user",text,replyTo:to?.id||null,createdAt:nowIso()};
+    this.add("momentComments",c);
+    await this.queueSession([{type:"moment_comment",owner:x.owner,targetText:x.text||"(photo)",text,replyTo:to&&to.actor==="character"?to.text:""}]);
+    // 评论 TA 的帖子、或回复 TA 的评论 → TA 会回。只是在自己帖子下自言自语就不打扰 TA（除非是回 TA）
+    if(x.owner==="character"||to?.actor==="character")await this.queueMomentJob({type:"reply",momentId:mid,commentId:c.id});
+    return j({ok:true,comment:c});
+  }
+  deleteMomentComment(cid){
+    const c=this.list("momentComments").find(z=>z.id===cid);if(!c)return j({ok:false,error:"Not found"},404);
+    if(c.actor!=="user")return j({ok:false,error:"只能删你自己的评论"},403);
+    this.save("momentComments",this.list("momentComments").filter(z=>z.id!==cid&&z.replyTo!==cid));
+    this.put("moments:jobs",this.get("moments:jobs",[]).filter(z=>z.commentId!==cid));
+    return j({ok:true});
+  }
+
+  /* ── TA 的回应 ── */
+  async ensurePhotoNotes(x){
+    let changed=false;
+    for(const im of x.images||[]){if(im.summary)continue;try{im.summary=await this.describeImage(im.id,"moment");changed=true;}catch{}}
+    if(changed)this.save("moments",this.list("moments").map(z=>z.id===x.id?{...z,images:x.images}:z));
+  }
+  async reactToUserMoment(x,{force=false}={}){
+    const s=this.settings();
+    await this.ensurePhotoNotes(x);
+    const already=this.list("momentLikes").some(l=>l.momentId===x.id&&l.actor==="character"),commented=this.list("momentComments").some(c=>c.momentId===x.id&&c.actor==="character"&&!c.replyTo);
+    if(already&&commented&&!force)return {liked:false,commented:false};
+    const recent=this.list("moments").filter(z=>z.id!==x.id).slice(-4).map(z=>this.momentText(z)).join("\n\n");
+    const sys=`${this.momentPersona()}
+
+TASK: ${s.userName} just posted on her Moments. You scrolled past it. React the way YOU naturally would: usually a like, and if you have something to say, ONE short comment (one or two sentences, casual, like a real Moments comment — teasing, caring, curious, whatever fits you). Respond to what is actually in the post and the photos. Never describe the photo back to her mechanically; never mention "description" or that you were told what is in the photo. If the photos could not be described, react to the text only.${already?" You already liked it.":""}${commented?" You already commented; only reply if there is something new.":""}
+RECENT POSTS (context):\n${recent||"(none)"}
+Return ONLY JSON: {"like":true|false,"comment":"text or empty string"}`;
+    const o=this.loose(await this.callLLM({},[{role:"system",content:sys},{role:"user",content:`THE NEW POST:\n${this.momentText(x)}`}],400))||{};
+    let liked=false,did=false;
+    if(o.like!==false&&!already){this.add("momentLikes",{id:id("ml"),momentId:x.id,actor:"character",createdAt:nowIso()});liked=true;}
+    const ctext=String(o.comment||"").trim().slice(0,500);
+    if(ctext&&!commented){this.add("momentComments",{id:id("mc"),momentId:x.id,actor:"character",text:ctext,replyTo:null,createdAt:nowIso()});did=true;}
+    if(liked||did){
+      this.add("notifications",{id:id("n"),text:`${s.characterName} ${liked&&did?"赞了并评论了":liked?"赞了":"评论了"}你的朋友圈${did?`：“${ctext.slice(0,60)}”`:""}`,read:false,createdAt:nowIso(),activityDate:this.localDate()});
+      this.queueCharacter(`${s.characterName} ${[liked?"liked":"",did?`commented “${ctext}” on`:""].filter(Boolean).join(" and ")} ${s.userName}'s Moments post “${String(x.text||"(photo)").slice(0,120)}”.`);
+    }
+    return {liked,commented:did};
+  }
+  async replyToMomentComment(x,c){
+    const s=this.settings();
+    if(this.list("momentComments").some(z=>z.actor==="character"&&z.replyTo===c.id))return false;
+    await this.ensurePhotoNotes(x);
+    const sys=`${this.momentPersona()}
+
+TASK: on a Moments post, ${s.userName} left the comment [${c.id}]. Reply to her in character with ONE short comment (one or two sentences, casual). Stay on the topic of the post and the thread. If this post is yours, you are the author answering under your own post.
+Return ONLY JSON: {"reply":"text"}`;
+    const o=this.loose(await this.callLLM({},[{role:"system",content:sys},{role:"user",content:`POST AND THREAD:\n${this.momentText(x)}\n\nREPLY TO: [${c.id}] “${c.text}”`}],300))||{};
+    const text=String(o.reply||"").trim().slice(0,500);if(!text)throw new Error("模型没给回复");
+    this.add("momentComments",{id:id("mc"),momentId:x.id,actor:"character",text,replyTo:c.id,createdAt:nowIso()});
+    this.add("notifications",{id:id("n"),text:`${s.characterName} 回复了你的评论：“${text.slice(0,60)}”`,read:false,createdAt:nowIso(),activityDate:this.localDate()});
+    this.queueCharacter(`${s.characterName} replied “${text}” to ${s.userName}'s comment “${c.text.slice(0,120)}” on Moments.`);
+    return true;
+  }
+
+  /* ── TA 发的 ── */
+  async publishCharacterMoment({text,imagePrompt,source,sourceRef}){
+    const s=this.settings();text=String(text||"").trim().slice(0,1500);if(!text)return null;
+    const images=s.moments.withImage&&String(imagePrompt||"").trim()?await this.maybeAgentImage(imagePrompt):[];
+    const x={id:id("m"),owner:"character",text,images:images.map(q=>({id:q.id,summary:q.summary||""})),source,sourceRef:sourceRef||"",imagePrompt:String(imagePrompt||"").slice(0,500),createdAt:nowIso(),updatedAt:nowIso()};
+    this.add("moments",x);
+    this.add("notifications",{id:id("n"),text:`${s.characterName} 发了一条朋友圈：“${text.slice(0,60)}”`,read:false,createdAt:nowIso(),activityDate:this.localDate()});
+    this.queueCharacter(`${s.characterName} posted on their Moments: “${text}”${x.images.length?` (with a photo: ${x.images.map(q=>q.summary).filter(Boolean).join("; ")||x.imagePrompt})`:""}`);
+    return x;
+  }
+  async composeMoment({source="manual",hint=""}={}){
+    const s=this.settings(),date=this.localDate();
+    const mine=this.list("moments").filter(z=>z.owner==="character").slice(-6).map(z=>`- ${this.stampOfMs(Date.parse(z.createdAt)||0)}: ${z.text}`).join("\n");
+    const uctx=await this.uranusContext(date);
+    const canImg=s.moments.withImage&&s.image.enabled;
+    const sys=`${this.momentPersona()}
+
+TASK: write ONE new Moments post of your own, right now (${this.stampOfMs(Date.now())}). It should come from YOUR real recent life as shown in URANUS MEMORY and your schedule — something you would actually want to share: a moment, a feeling, a scene, a small win, a complaint, a joke. Do NOT invent major events that contradict memory. Do not repeat what you already posted. Keep it short like a real Moments post (1–3 sentences, no hashtags spam).${hint?`\nTHE USER ASKED FOR: ${hint}`:""}
+${canImg?`If a photo would naturally go with it, add "imagePrompt": a concise visual description of the photo you'd attach (what the camera sees, style: casual phone photo). Do not draw ${s.userName} or yourself as recognizable people unless the persona clearly allows it. Use "" for no photo.`:`Image generation is off, so "imagePrompt" must be "".`}
+If there is truly nothing you'd want to post, return {"text":""}.
+${uctx}
+YOUR SCHEDULE TODAY:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="character"&&x.date===date).map(x=>({time:x.time,title:x.text,status:x.status})))}
+YOUR RECENT POSTS:\n${mine||"(none)"}
+Return ONLY JSON: {"text":"...","imagePrompt":"..."}`;
+    const o=this.loose(await this.callLLM({},[{role:"system",content:sys},{role:"user",content:"Post now."}],500))||{};
+    return this.publishCharacterMoment({text:o.text,imagePrompt:o.imagePrompt,source});
+  }
+  /* 从记忆挑朋友圈：candidates = [{sourceId, kind, text, recordedMs, recordedDate}] */
+  async momentsFromSources(cands,{force=false}={}){
+    const s=this.settings(),ms=s.moments;
+    const left=Math.max(0,(Number(ms.maxPerDay)||0)-this.momentsToday("character"));
+    if(!force&&!left)return 0;
+    const used=new Set(this.get("moments:usedRefs",[]));
+    const list=cands.filter(c=>!used.has(c.sourceId)).slice(-12);if(!list.length)return 0;
+    const n=force?1:Math.min(left,2);
+    const canImg=ms.withImage&&s.image.enabled;
+    const mine=this.list("moments").filter(z=>z.owner==="character").slice(-6).map(z=>`- ${z.text}`).join("\n");
+    const sys=`${this.momentPersona()}
+
+TASK: below are fresh entries from your own memory (summaries of what happened in your chats with ${s.userName}, and your diary). Decide whether any of them is something YOU would post on Moments. Good material: a moment of your day, a mood, a scene, a small joy or annoyance, something you did together that you'd proudly/teasingly show off. NOT suitable: private or intimate details, arguments, secrets, health/medical details about ${s.userName}, money, plain logistics, anything she would not want others to see. ${force?"Pick the single most suitable one (only skip if none could be posted at all).":`Pick at most ${n}. It is completely fine to pick none.`}
+For each pick, write the post AS YOU, in your voice, 1–3 sentences — a social post, not a summary. ${canImg?`Add "imagePrompt": a concise visual description of a casual phone photo that would go with it (no recognizable faces of real people), or "" for none.`:`Image generation is off: "imagePrompt" must be "".`}
+YOUR RECENT POSTS (don't repeat):\n${mine||"(none)"}
+Return ONLY JSON: {"posts":[{"ref":"exact ref","text":"...","imagePrompt":"..."}]}`;
+    const src=list.map(c=>({ref:c.sourceId,kind:c.kind,when:this.stampOfMs(c.recordedMs||Date.now()),text:String(c.text||"").slice(0,c.kind==="diary"?2500:900)}));
+    const o=this.loose(await this.callLLM({},[{role:"system",content:sys},{role:"user",content:`MEMORY ENTRIES:\n${JSON.stringify(src)}`}],900))||{};
+    let made=0;
+    for(const p of (Array.isArray(o.posts)?o.posts:[]).slice(0,n)){
+      const c=list.find(z=>z.sourceId===String(p?.ref||""));if(!c||used.has(c.sourceId))continue;
+      const x=await this.publishCharacterMoment({text:p.text,imagePrompt:p.imagePrompt,source:"memory",sourceRef:c.sourceId});
+      if(x){used.add(c.sourceId);made++;}
+    }
+    // 看过的都记下，不管发没发：同一条记忆不会被反复拿出来问
+    if(!force)for(const c of list)used.add(c.sourceId);
+    this.put("moments:usedRefs",[...used].slice(-600));
+    return made;
+  }
+  /* 手动「从记忆里挑一条」：直接读 Uranus 最近两天的记忆和日记 */
+  async momentsFromUranus(){
+    const cfg=this.orgSettings();if(!cfg.roleKey)throw new Error("先在设置「整理」里选好要读哪个 Uranus 角色。");
+    const lib=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}`);
+    const floor=this.isoPlus(this.localDate(),-2),cands=[];
+    for(const m of lib.memories||[]){const t=String(m.content||"").trim(),ms=Number(m.timestamp)||Date.now(),d=m.date||this.dateOfMs(ms);if(t&&d>=floor)cands.push({sourceId:`memory:${m.id}`,kind:"memory",text:t,recordedMs:ms,recordedDate:d});}
+    for(const d of (lib.diaries||[]).filter(z=>String(z.date)>=floor).slice(-2)){try{const b=await this.uranus(`/api/memories/${encodeURIComponent(cfg.roleKey)}/diary/${encodeURIComponent(d.file)}`);cands.push({sourceId:`diary:${d.file}`,kind:"diary",text:String(b.text||""),recordedMs:Date.parse(d.date+"T12:00:00Z")||Date.now(),recordedDate:d.date});}catch{}}
+    if(!cands.length)throw new Error("最近两天 Uranus 里没有新记忆。");
+    return this.momentsFromSources(cands,{force:true});
+  }
+
   bridgeUrl(raw){ try{ const u=new URL(String(raw||"").trim()); if(!u.pathname||u.pathname==="/")u.pathname="/api/companion/bridge"; return u.toString(); }catch{return String(raw||"").trim();} }
   async pushBridge(type,text,meta={}){
     const s=this.settings(),b=s.bridge;
@@ -1148,16 +1447,17 @@ CALENDAR:\n${cal}\nEXISTING ACTIVITIES (date | title):\n${existing}\nFORMAL DIAR
       return {ok:true,status:r.status,url,response,accepted:response?.accepted===true,packetId:String(response?.packetId||"")};
     }catch(e){return {ok:false,url,error:`Failed to reach Uranus: ${e?.message||e}`};}
   }
-  async arm(){const deadline=Number(this.get("session:deadline",0))||0,next=deadline>Date.now()?Math.min(deadline,Date.now()+10*60000):Date.now()+10*60000;await this.ctx.storage.setAlarm(next)}
+  async arm(){const now=Date.now(),deadline=Number(this.get("session:deadline",0))||0;let next=deadline>now?Math.min(deadline,now+10*60000):now+10*60000;const job=this.nextMomentJobAt();if(job)next=Math.min(next,Math.max(job,now+1000));await this.ctx.storage.setAlarm(next)}
   async alarm(){
     // 先把下一跳排上：这一跳里任何一步抛错，闹钟链都不会断（以前 arm 在最后，一抛错就再也不跳了）
     try{await this.arm();}catch{}
+    try{ await this.runMomentJobs(); }catch{}
     try{ await this.orgTick(); }catch{}
     const deadline=Number(this.get("session:deadline",0))||0;if(deadline&&deadline<=Date.now()){try{await this.commitSession(new Request("https://local/api/session/commit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({representation:"original",actions:[]})}))}catch{}}
     const st=this.settings(),tz=st.timezone||this.env.TZ||"America/New_York";this.pruneActivity();
     const pp=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date()).reduce((o,x)=>(o[x.type]=x.value,o),{}),day=`${pp.year}-${pp.month}-${pp.day}`,cur=(+pp.hour)*60+(+pp.minute);
     for(const [tag,target,label] of [["noon",720,"12:00 PM"],["21",1260,"9:00 PM"]])if(cur>=target&&cur<target+20&&!this.get(`charsync:${day}:${tag}`,false)){if(this.get("pending:character",[]).length)await this.flushCharacterContext(label);this.put(`charsync:${day}:${tag}`,true)}
-    if(st.autonomy.enabled&&st.autonomy.maxVisits>0){const [sh,sm]=st.autonomy.activeStart.split(":").map(Number),[eh,em]=st.autonomy.activeEnd.split(":").map(Number);if(cur>=sh*60+sm&&cur<=eh*60+em){const key=`visits:${day}`,count=this.get(key,0),target=this.get(`${key}:target`,null)??Math.floor(Math.random()*(st.autonomy.maxVisits-st.autonomy.minVisits+1))+st.autonomy.minVisits;this.put(`${key}:target`,target);const lastAt=Number(this.get("visits:last",0))||0,gapOk=Date.now()-lastAt>=Math.max(0,Number(st.autonomy.minIntervalMinutes)||0)*60000;if(count<target&&gapOk){const counts=this.get(`${key}:kinds`,{schedule:0,diary:0,interact:0,review:0}),hasDiary=this.list("diary").some(x=>x.owner==="character"&&x.date===day),us=this.list("schedule").some(x=>x.owner==="user"&&x.date===day),ud=this.list("diary").some(x=>x.owner==="user"&&x.date===day),eligible=[{kind:"schedule",mode:"write_schedule",n:counts.schedule||0}];if(!hasDiary)eligible.push({kind:"diary",mode:"write_diary",n:counts.diary||0});if(this.list("schedule").some(x=>x.owner==="character"&&(x.status||"planned")==="planned"&&x.date&&x.date<=day))eligible.push({kind:"review",mode:"review_status",n:counts.review||0});if(us||ud)eligible.push({kind:"interact",mode:ud&&(!us||Math.random()<.5)?"look_diary":"look_schedule",n:counts.interact||0});const mn=Math.min(...eligible.map(x=>x.n)),pool=eligible.filter(x=>x.n===mn),pick=pool[Math.floor(Math.random()*pool.length)];this.put("visits:last",Date.now());try{const out=await this.applyAgent(await this.callAgent(pick.mode,day),pick.mode,day);if(Object.values(out).some(Boolean)||pick.kind==="review"){counts[pick.kind]=(counts[pick.kind]||0)+1;this.put(`${key}:kinds`,counts);this.put(key,count+1);this.put("visits:last",Date.now())}}catch{}}}}
+    if(st.autonomy.enabled&&st.autonomy.maxVisits>0){const [sh,sm]=st.autonomy.activeStart.split(":").map(Number),[eh,em]=st.autonomy.activeEnd.split(":").map(Number);if(cur>=sh*60+sm&&cur<=eh*60+em){const key=`visits:${day}`,count=this.get(key,0),target=this.get(`${key}:target`,null)??Math.floor(Math.random()*(st.autonomy.maxVisits-st.autonomy.minVisits+1))+st.autonomy.minVisits;this.put(`${key}:target`,target);const lastAt=Number(this.get("visits:last",0))||0,gapOk=Date.now()-lastAt>=Math.max(0,Number(st.autonomy.minIntervalMinutes)||0)*60000;if(count<target&&gapOk){const counts=this.get(`${key}:kinds`,{schedule:0,diary:0,interact:0,review:0}),hasDiary=this.list("diary").some(x=>x.owner==="character"&&x.date===day),us=this.list("schedule").some(x=>x.owner==="user"&&x.date===day),ud=this.list("diary").some(x=>x.owner==="user"&&x.date===day),eligible=[{kind:"schedule",mode:"write_schedule",n:counts.schedule||0}];if(!hasDiary)eligible.push({kind:"diary",mode:"write_diary",n:counts.diary||0});if(this.list("schedule").some(x=>x.owner==="character"&&(x.status||"planned")==="planned"&&x.date&&x.date<=day))eligible.push({kind:"review",mode:"review_status",n:counts.review||0});if(us||ud)eligible.push({kind:"interact",mode:ud&&(!us||Math.random()<.5)?"look_diary":"look_schedule",n:counts.interact||0});const mset=st.moments;if(mset.enabled&&mset.autoPost&&this.momentsToday("character")<Math.max(0,Number(mset.maxPerDay)||0))eligible.push({kind:"moment",mode:"moment",n:counts.moment||0});const mn=Math.min(...eligible.map(x=>x.n)),pool=eligible.filter(x=>x.n===mn),pick=pool[Math.floor(Math.random()*pool.length)];this.put("visits:last",Date.now());try{const out=pick.mode==="moment"?{moment:(await this.composeMoment({source:"auto"}))?1:0}:await this.applyAgent(await this.callAgent(pick.mode,day),pick.mode,day);if(Object.values(out).some(Boolean)||pick.kind==="review"){counts[pick.kind]=(counts[pick.kind]||0)+1;this.put(`${key}:kinds`,counts);this.put(key,count+1);this.put("visits:last",Date.now())}}catch{}}}}
     await this.arm();
   }
 }
