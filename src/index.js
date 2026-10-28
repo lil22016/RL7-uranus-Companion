@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { LifeMixin, MAP_DEFAULTS } from "./life.js";
 
 const j = (data, status=200) => new Response(JSON.stringify(data), {status, headers:{"content-type":"application/json; charset=utf-8"}});
 const nowIso = () => new Date().toISOString();
@@ -25,7 +26,7 @@ export class Companion extends DurableObject {
   constructor(ctx, env){ super(ctx,env); this.ctx=ctx; this.env=env; }
   get(k,d=null){ const v=this.ctx.storage.kv.get(k); return v===undefined?d:v; }
   put(k,v){ this.ctx.storage.kv.put(k,v); }
-  settings(){ return {...DEFAULTS,...this.get("settings",{}), autonomy:{...DEFAULTS.autonomy,...(this.get("settings",{}).autonomy||{})}, agent:{...DEFAULTS.agent,...(this.get("settings",{}).agent||{})}, bridge:{...DEFAULTS.bridge,...(this.get("settings",{}).bridge||{})},image:{...DEFAULTS.image,...(this.get("settings",{}).image||{})},vision:{...DEFAULTS.vision,...(this.get("settings",{}).vision||{})},moments:{...DEFAULTS.moments,...(this.get("settings",{}).moments||{})}}; }
+  settings(){ return {...DEFAULTS,...this.get("settings",{}), autonomy:{...DEFAULTS.autonomy,...(this.get("settings",{}).autonomy||{})}, agent:{...DEFAULTS.agent,...(this.get("settings",{}).agent||{})}, bridge:{...DEFAULTS.bridge,...(this.get("settings",{}).bridge||{})},image:{...DEFAULTS.image,...(this.get("settings",{}).image||{})},vision:{...DEFAULTS.vision,...(this.get("settings",{}).vision||{})},moments:{...DEFAULTS.moments,...(this.get("settings",{}).moments||{})},map:{...MAP_DEFAULTS,...(this.get("settings",{}).map||{})}}; }
   list(kind){ return this.get(`list:${kind}`,[]); }
   save(kind, arr){ this.put(`list:${kind}`,arr); }
   add(kind, item){ const arr=this.list(kind); arr.push(item); this.save(kind,arr); return item; }
@@ -91,6 +92,7 @@ export class Companion extends DurableObject {
     if(p==="/api/session/simplify"&&m==="POST") return this.simplifySession();
     if(p==="/api/session/simplified"&&m==="PUT") return this.saveSimplifiedSession(req);
     if(p==="/api/session/commit"&&m==="POST") return this.commitSession(req);
+    if(p.startsWith("/api/period")||p.startsWith("/api/focus")||p.startsWith("/api/map")){ const r=await this.lifeRoute(req,p,m); if(r)return r; }
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
   }
@@ -175,7 +177,7 @@ export class Companion extends DurableObject {
         if(m?.method==="initialize")return {jsonrpc:"2.0",id,result:{protocolVersion:String(m.params?.protocolVersion||"2025-06-18"),capabilities:{tools:{}},serverInfo:{name:"companion",version:"1.0.0"}}};
         if(String(m?.method||"").startsWith("notifications/"))return null;
         if(m?.method==="ping")return {jsonrpc:"2.0",id,result:{}};
-        if(m?.method==="tools/list")return {jsonrpc:"2.0",id,result:{tools:this.mcpTools()}};
+        if(m?.method==="tools/list")return {jsonrpc:"2.0",id,result:{tools:[...this.mcpTools(),...this.lifeMcpTools()]}};
         if(m?.method==="tools/call"){
           const name=String(m.params?.name||""),args=m.params?.arguments||{};
           try{const r=await this.mcpCall(name,args);return {jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify(r)}]}};}
@@ -239,6 +241,7 @@ export class Companion extends DurableObject {
       const x=this.update("schedule",old.id,{status:a.status,statusChangedAt:nowIso(),statusBy:"character",statusNote:reason});
       return {ok:true,item:slim(x)};
     }
+    const life=await this.lifeMcpCall(name,a); if(life!==undefined)return life;
     throw new Error("Unknown tool: "+name);
   }
   async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; let got=req.headers.get("x-companion-key")||""; if(!got&&req.method==="GET"){const u=new URL(req.url); if(u.pathname.startsWith("/api/image/")||u.pathname.startsWith("/api/font/")||u.pathname==="/api/share/cover")got=u.searchParams.get("k")||"";} return got===secret; }
@@ -283,7 +286,7 @@ export class Companion extends DurableObject {
   queueCharacter(text){const q=this.get("pending:character",[]);q.push({id:crypto.randomUUID(),text:String(text).slice(0,1600),createdAt:nowIso()});this.put("pending:character",q.slice(-100))}
   async flushCharacterContext(reason="scheduled"){const q=this.get("pending:character",[]);if(!q.length)return j({ok:true,empty:true});const packet=q.map(x=>`[${this.formatSessionTime(x.createdAt)}] ${x.text}`).join("\n"),packetId=crypto.randomUUID();this.add("notifications",{id:id("n"),text:"Character context syncing to Uranus…",read:false,createdAt:nowIso(),activityDate:this.localDate()});const r=await this.pushBridge("character_life",packet,{actor:"character",source:"companion",origin:`character_context_${reason}`,packetId});if(r.ok&&r.accepted){this.put("pending:character",[]);this.add("notifications",{id:id("n"),text:`Character context synced to Uranus · ${reason}.`,read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:true,accepted:true})}this.add("notifications",{id:id("n"),text:"Character context sync failed · retained for retry.",read:false,createdAt:nowIso(),activityDate:this.localDate()});return j({ok:false,error:r.error||"No ACK"},502)}
   pruneActivity(){const tz=this.settings().timezone||this.env.TZ||"America/New_York",fmt=d=>new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d),t=fmt(new Date()),y=new Date();y.setDate(y.getDate()-1);const keep=new Set([t,fmt(y)]);this.save("notifications",this.list("notifications").filter(n=>keep.has(n.activityDate||fmt(new Date(n.createdAt)))))}
-  async setSettings(req){ const b=await this.body(req); const old=this.settings(); const a=b.autonomy||{}; const next={...old,...b,autonomy:{...old.autonomy,...a,minVisits:clamp(a.minVisits??old.autonomy.minVisits,0,10),maxVisits:clamp(a.maxVisits??old.autonomy.maxVisits,0,10),minIntervalMinutes:clamp(a.minIntervalMinutes??old.autonomy.minIntervalMinutes,0,1440)},reactionLibrary:[...new Set((b.reactionLibrary??old.reactionLibrary).map(String))].slice(0,50)}; if(next.autonomy.maxVisits<next.autonomy.minVisits)next.autonomy.maxVisits=next.autonomy.minVisits; next.garden=old.garden||{token:""}; next.mcp=old.mcp||{token:""}; this.put("settings",next); await this.arm(); return j({ok:true,settings:next}); }
+  async setSettings(req){ const b=await this.body(req); const old=this.settings(); const a=b.autonomy||{}; const next={...old,...b,autonomy:{...old.autonomy,...a,minVisits:clamp(a.minVisits??old.autonomy.minVisits,0,10),maxVisits:clamp(a.maxVisits??old.autonomy.maxVisits,0,10),minIntervalMinutes:clamp(a.minIntervalMinutes??old.autonomy.minIntervalMinutes,0,1440)},reactionLibrary:[...new Set((b.reactionLibrary??old.reactionLibrary).map(String))].slice(0,50)}; if(next.autonomy.maxVisits<next.autonomy.minVisits)next.autonomy.maxVisits=next.autonomy.minVisits; next.garden=old.garden||{token:""}; next.map=this.get("settings",{}).map||old.map; /* 地图设置只走 /api/map/settings，免得设置页拿着旧副本整份覆盖 */ next.mcp=old.mcp||{token:""}; this.put("settings",next); await this.arm(); return j({ok:true,settings:next}); }
   newActivity(o){ const t=v=>/^\d{2}:\d{2}$/.test(String(v||"").slice(0,5))?String(v).slice(0,5):"",d=v=>/^\d{4}-\d{2}-\d{2}$/.test(String(v||"").slice(0,10))?String(v).slice(0,10):""; const time=t(o.time),end=time?t(o.end):""; return {id:id("s"),owner:o.owner||"user",date:d(o.date),time,end,deadline:!!(o.deadline&&time&&!end),text:String(o.text||"").trim().slice(0,1000),desc:String(o.desc||"").trim().slice(0,2000),status:["planned","done","failed"].includes(o.status)?o.status:"planned",images:Array.isArray(o.images)?o.images.slice(0,4):[],statusImages:[],history:[],changedFrom:o.changedFrom||null,changedTo:null,suggestionId:o.suggestionId||null,suggestedBy:o.suggestedBy||null,createdAt:nowIso(),updatedAt:nowIso()}; }
   async createSchedule(req){ const b=await this.body(req); const text=String(b.text||"").trim(); if(!text)return j({ok:false,error:"Title required"},400); const x=this.newActivity({owner:"user",date:b.date,time:b.time,end:b.end,deadline:b.deadline,text,desc:b.desc,images:b.images}); this.add("schedule",x); return j({ok:true,item:x}); }
   makeChange(x,spec,by="user"){
@@ -1513,6 +1516,7 @@ Return ONLY JSON: {"posts":[{"ref":"exact ref","text":"...","imagePrompt":"..."}
     try{await this.arm();}catch{}
     try{ await this.runMomentJobs(); }catch{}
     try{ await this.orgTick(); }catch{}
+    try{ await this.mapTick(); }catch{}
     const deadline=Number(this.get("session:deadline",0))||0;if(deadline&&deadline<=Date.now()){try{await this.commitSession(new Request("https://local/api/session/commit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({representation:"original",actions:[]})}))}catch{}}
     const st=this.settings(),tz=st.timezone||this.env.TZ||"America/New_York";this.pruneActivity();
     const pp=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date()).reduce((o,x)=>(o[x.type]=x.value,o),{}),day=`${pp.year}-${pp.month}-${pp.day}`,cur=(+pp.hour)*60+(+pp.minute);
@@ -1521,5 +1525,7 @@ Return ONLY JSON: {"posts":[{"ref":"exact ref","text":"...","imagePrompt":"..."}
     await this.arm();
   }
 }
+
+Object.assign(Companion.prototype, LifeMixin);
 
 export default { async scheduled(_ev,env,ctx){ ctx.waitUntil(env.COMPANION.get(env.COMPANION.idFromName("main")).wake().catch(()=>{})); }, async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")||u.pathname.startsWith("/garden/")||u.pathname.startsWith("/s/")||u.pathname==="/mcp"){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
