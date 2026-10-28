@@ -244,9 +244,22 @@ export const LifeMixin = {
       autoNext: false,
       keepAwake: false,
       tellCharacter: true,
+      breathe: true,
       lines: {},
       ...c,
-      art: { imageId: "", scale: 100, x: 0, y: 0, flip: false, ...(c.art || {}) },
+      art: this.focusArt(c.art),
+    };
+  },
+  /** 立绘：Study 和 Stay 的布局不一样，大小 / 位置各存一份（旧数据只有一份 → 当作 Study 的） */
+  focusArt(a) {
+    a = a || {};
+    const box = (o, d) => ({ scale: num(o?.scale, 40, 200, d.scale), x: num(o?.x, -220, 220, d.x), y: num(o?.y, -260, 260, d.y) });
+    const legacy = { scale: a.scale ?? 100, x: a.x ?? 0, y: a.y ?? 0 };
+    return {
+      imageId: str(a.imageId, 80),
+      flip: !!a.flip,
+      study: box(a.study || legacy, { scale: 100, x: 0, y: 0 }),
+      stay: box(a.stay, { scale: 82, x: 0, y: 0 }),
     };
   },
   focusGet() {
@@ -258,7 +271,7 @@ export const LifeMixin = {
     const b = await this.body(req), o = this.focusCfg();
     const n = { ...o };
     for (const [k, a, z] of [["focusMinutes", 1, 180], ["breakMinutes", 1, 60], ["longBreakMinutes", 1, 90], ["longEvery", 0, 12]]) if (b[k] !== undefined) n[k] = num(b[k], a, z, o[k]);
-    for (const k of ["autoNext", "keepAwake", "tellCharacter"]) if (b[k] !== undefined) n[k] = !!b[k];
+    for (const k of ["autoNext", "keepAwake", "tellCharacter", "breathe"]) if (b[k] !== undefined) n[k] = !!b[k];
     if (b.lines && typeof b.lines === "object") {
       n.lines = {};
       for (const k of ["study", "soft", "tease", "stay", "done", "start"]) {
@@ -273,13 +286,12 @@ export const LifeMixin = {
           this.deleteImage(o.art.imageId);
         } catch {}
       }
-      n.art = {
-        imageId: a.imageId !== undefined ? str(a.imageId, 80) : o.art.imageId,
-        scale: num(a.scale ?? o.art.scale, 40, 180, 100),
-        x: num(a.x ?? o.art.x, -200, 200, 0),
-        y: num(a.y ?? o.art.y, -220, 220, 0),
-        flip: a.flip !== undefined ? !!a.flip : o.art.flip,
-      };
+      n.art = this.focusArt({
+        imageId: a.imageId !== undefined ? a.imageId : o.art.imageId,
+        flip: a.flip !== undefined ? a.flip : o.art.flip,
+        study: a.study ? { ...o.art.study, ...a.study } : o.art.study,
+        stay: a.stay ? { ...o.art.stay, ...a.stay } : o.art.stay,
+      });
     }
     this.put("focus:cfg", n);
     return j({ ok: true, cfg: n });
