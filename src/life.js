@@ -414,6 +414,10 @@ export const LifeMixin = {
         visible: b.me.visible !== undefined ? !!b.me.visible : o.me.visible,
         since: o.me.since || "",
       };
+      // 你在哪个房间（只在放到某个地点时有意义；换了地点没说房间就清掉）
+      const placeChanged = n.me.placeId !== o.me.placeId;
+      n.me.roomId = b.me.roomId !== undefined ? str(b.me.roomId, 40) : placeChanged ? "" : o.me.roomId || "";
+      if (!n.me.placeId) n.me.roomId = "";
       const changed = n.me.placeId !== o.me.placeId || n.me.x !== o.me.x || n.me.y !== o.me.y || (n.me.visible && !o.me.visible);
       if (changed) n.me.since = nowIso();
       // 你换了地方：过 5–25 分钟让他「看到」，自己决定要不要过来（不是每次都会来）
@@ -618,7 +622,7 @@ export const LifeMixin = {
         `NOW: ${weekday} ${ln.date} ${ln.time} (${this.tzName()})`,
         quiet ? `(Overnight quiet hours with no checks: ${quiet}. Whatever you pick may need to last until the next check.)` : "",
         `CURRENTLY: ${cur ? `${cur.name} (${cur.id})${curRoom ? `, in the ${curRoom.name}` : ""}, since ${fmtT(st.since)}${st.activity ? `, ${st.activity}` : ""}` : "unknown"}`,
-        `${userName.toUpperCase()} RIGHT NOW: ${herPlace ? `at ${herPlace.name} (${herPlace.id}) since ${fmtT(meta.me.since)}` : "location not shared"}`,
+        `${userName.toUpperCase()} RIGHT NOW: ${herPlace ? `at ${herPlace.name} (${herPlace.id})${findRoom(herPlace, meta.me.roomId) ? `, in the ${findRoom(herPlace, meta.me.roomId).name}` : ""} since ${fmtT(meta.me.since)}` : "location not shared"}`,
         `${userName.toUpperCase()}'S PLANS TODAY:\n${herSched.slice(0, 12).join("\n") || "(nothing listed)"}`,
         reactPlace ? `TRIGGER: ${userName} just updated her location to ${reactPlace.name} a few minutes ago, and ${name} noticed. Decide whether he does anything about it — going to see her, meeting her nearby, or simply carrying on — whatever fits him, his plans and the time. He does not always come running.` : "",
         `KNOWN PLACES (id | name | kind | note):\n${placeLines.join("\n") || "(none yet)"}`,
@@ -708,7 +712,7 @@ export const LifeMixin = {
         current: cur ? { place: placeOut(cur), room: findRoom(cur, st.roomId)?.name || "", activity: st.activity, since: st.since } : null,
         user: (() => {
           const m = this.mapMeta(), hp = m.me?.visible !== false ? places.find((x) => x.id === m.me?.placeId) : null;
-          return hp ? { name: this.settings().userName, at: hp.name, since: m.me.since || "" } : { name: this.settings().userName, at: null, note: "She hasn't shared her location on the map." };
+          return hp ? { name: this.settings().userName, at: hp.name, room: findRoom(hp, m.me.roomId)?.name || "", since: m.me.since || "" } : { name: this.settings().userName, at: null, note: "She hasn't shared her location on the map." };
         })(),
         todayTrail: this.list("mapVisits").filter((v) => v.date === ln.date || (!v.end && v.id === st.visitId)).map((v) => ({ place: v.placeName, room: v.roomName || "", from: v.startTime, to: v.end ? v.endTime : "now", activity: v.activity })),
         places: places.map(placeOut),
