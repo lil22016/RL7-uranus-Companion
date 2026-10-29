@@ -49,6 +49,8 @@ export const MAP_DEFAULTS = {
   allowNewPlaces: true,
   usePersona: true,
   language: "",
+  spontaneity: "normal", // low | normal | high：日程之外他有多「随性」
+  reactToUser: true, // 你在地图上换了位置 → 过一会儿让他「看到」，自己决定要不要过来
 };
 
 export const PLACE_KINDS = ["home", "work", "study", "cafe", "food", "shop", "park", "gym", "bar", "friend", "transit", "culture", "other"];
@@ -127,6 +129,21 @@ function parseJsonLoose(t) {
 
 const normName = (s) => String(s || "").toLowerCase().replace(/[\s\-_·'’"“”.,，。!！?？()（）]/g, "");
 
+/** 地点里的房间（子地图）：[{id,name,icon}]，按 id / 名字沿用旧 id，最多 12 个 */
+function cleanRooms(arr, old = []) {
+  const out = [], seen = new Set();
+  for (const r of Array.isArray(arr) ? arr : []) {
+    const name = str(r?.name, 30);
+    if (!name || seen.has(normName(name))) continue;
+    seen.add(normName(name));
+    const prev = old.find((o) => (r.id && o.id === r.id) || normName(o.name) === normName(name));
+    out.push({ id: prev?.id || str(r.id, 40) || uid("rm"), name, icon: str(r.icon, 8) || "" });
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+const findRoom = (pl, key) => (key ? (pl?.rooms || []).find((r) => r.id === key || normName(r.name) === normName(key)) : null);
+
 export const LifeMixin = {
   /* ═════════════ 路由 ═════════════ */
   async lifeRoute(req, p, m) {
@@ -165,7 +182,7 @@ export const LifeMixin = {
     if (p === "/api/map/move" && m === "POST") {
       const b = await this.body(req);
       try {
-        const r = await this.mapMoveTo(str(b.placeId, 80), str(b.activity, 160), "user");
+        const r = await this.mapMoveTo(str(b.placeId, 80), str(b.activity, 160), "user", "", str(b.room, 40));
         return j({ ok: true, ...r });
       } catch (e) {
         return j({ ok: false, error: e.message }, 400);
@@ -329,10 +346,10 @@ export const LifeMixin = {
     return m;
   },
   mapState() {
-    return { placeId: "", activity: "", since: "", visitId: "", by: "", nextCheckAt: 0, lastCheckAt: 0, lastError: "", lastReason: "", ...(this.get("map:state", null) || {}) };
+    return { placeId: "", roomId: "", activity: "", since: "", visitId: "", reactAt: 0, reactPlace: "", by: "", nextCheckAt: 0, lastCheckAt: 0, lastError: "", lastReason: "", ...(this.get("map:state", null) || {}) };
   },
   mapMeta() {
-    return { seed: 0, avatarRole: "", avatarUser: "", me: { placeId: "", x: null, y: null, visible: true }, ...(this.get("map:meta", null) || {}) };
+    return { seed: 0, avatarRole: "", avatarUser: "", me: { placeId: "", x: null, y: null, visible: true, since: "" }, ...(this.get("map:meta", null) || {}) };
   },
   mapPlaces() {
     return this.get("map:places", []) || [];
@@ -364,7 +381,8 @@ export const LifeMixin = {
     const all = this.get("settings", {});
     const cur = { ...MAP_DEFAULTS, ...(all.map || {}) };
     const n = { ...cur };
-    for (const k of ["enabled", "syncToUranus", "allowNewPlaces", "usePersona"]) if (b[k] !== undefined) n[k] = !!b[k];
+    for (const k of ["enabled", "syncToUranus", "allowNewPlaces", "usePersona", "reactToUser"]) if (b[k] !== undefined) n[k] = !!b[k];
+    if (["low", "normal", "high"].includes(b.spontaneity)) n.spontaneity = b.spontaneity;
     for (const k of ["source", "profileId", "uranusProviderId", "model", "language"]) if (b[k] !== undefined) n[k] = str(b[k], 200);
     if (b.minHours !== undefined) n.minHours = num(b.minHours, 0.5, 12, 2);
     if (b.maxHours !== undefined) n.maxHours = num(b.maxHours, 0.5, 24, 3);
@@ -394,7 +412,18 @@ export const LifeMixin = {
         x: b.me.x === null ? null : b.me.x !== undefined ? num(b.me.x, 0, 1000, 500) : o.me.x,
         y: b.me.y === null ? null : b.me.y !== undefined ? num(b.me.y, 0, 1000, 500) : o.me.y,
         visible: b.me.visible !== undefined ? !!b.me.visible : o.me.visible,
+        since: o.me.since || "",
       };
+      const changed = n.me.placeId !== o.me.placeId || n.me.x !== o.me.x || n.me.y !== o.me.y || (n.me.visible && !o.me.visible);
+      if (changed) n.me.since = nowIso();
+      // 你换了地方：过 5–25 分钟让他「看到」，自己决定要不要过来（不是每次都会来）
+      const ms = this.mapSettings(), st = this.mapState();
+      const pl = this.mapPlaces().find((x) => x.id === n.me.placeId);
+      if (changed && ms.enabled && ms.reactToUser && n.me.visible && pl && pl.id !== st.placeId) {
+        this.put("map:state", { ...st, reactAt: Date.now() + Math.round((5 + Math.random() * 20) * 60000), reactPlace: pl.id });
+      } else if (!n.me.visible && st.reactAt) {
+        this.put("map:state", { ...st, reactAt: 0, reactPlace: "" });
+      }
     }
     this.put("map:meta", n);
     return j({ ok: true, meta: n });
@@ -412,6 +441,7 @@ export const LifeMixin = {
       name,
       kind,
       note: str(b.note, 300),
+      rooms: cleanRooms(b.rooms),
       x: b.x === undefined || b.x === null ? null : num(b.x, 0, 1000, 500),
       y: b.y === undefined || b.y === null ? null : num(b.y, 0, 1000, 500),
       by,
@@ -434,6 +464,7 @@ export const LifeMixin = {
     }
     if (b.kind !== undefined && PLACE_KINDS.includes(b.kind)) pl.kind = b.kind;
     if (b.note !== undefined) pl.note = str(b.note, 300);
+    if (Array.isArray(b.rooms)) pl.rooms = cleanRooms(b.rooms, pl.rooms || []);
     if (b.x !== undefined) pl.x = b.x === null ? null : num(b.x, 0, 1000, 500);
     if (b.y !== undefined) pl.y = b.y === null ? null : num(b.y, 0, 1000, 500);
     pl.updatedAt = nowIso();
@@ -441,6 +472,7 @@ export const LifeMixin = {
     this.put("map:places", places);
     // Session 里存的是当时的名字快照，改名以后让「当前这一段」也跟上
     const st = this.mapState();
+    if (st.placeId === pid && st.roomId && !findRoom(pl, st.roomId)) this.put("map:state", { ...st, roomId: "" });
     if (st.placeId === pid && st.visitId && b.name !== undefined) {
       const arr = this.list("mapVisits"), v = arr.find((x) => x.id === st.visitId);
       if (v) {
@@ -459,23 +491,30 @@ export const LifeMixin = {
     return j({ ok: true });
   },
 
-  /** 把他挪到某个地点（同一个地点就只更新在做什么）。by: model | mcp | user */
-  async mapMoveTo(placeId, activity, by, reason = "") {
+  /**
+   * 把他挪到某个地点 / 某个房间（同一个地点里换房间、换在做的事，算同一段停留）。
+   * by: model | mcp | user
+   */
+  async mapMoveTo(placeId, activity, by, reason = "", roomKey = "") {
     const places = this.mapPlaces();
     const pl = places.find((x) => x.id === placeId);
     if (!pl) throw new Error("找不到这个地点");
+    const room = findRoom(pl, roomKey);
     const st = this.mapState();
     const ln = this.localNow();
     const visits = this.list("mapVisits");
     const at = nowIso();
-    let moved = false;
+    let moved = false, roomChanged = false;
     if (st.placeId === pl.id && st.visitId && visits.some((v) => v.id === st.visitId)) {
       const v = visits.find((x) => x.id === st.visitId);
-      if (activity && activity !== v.activity) {
-        v.log = [...(v.log || []), { at, time: ln.time, activity }].slice(-12);
-        v.activity = activity;
+      roomChanged = !!room && room.id !== st.roomId;
+      if ((activity && activity !== v.activity) || roomChanged) {
+        v.log = [...(v.log || []), { at, time: ln.time, activity: activity || v.activity, room: room?.name || "" }].slice(-16);
+        if (activity) v.activity = activity;
       }
+      if (room) Object.assign(v, { roomId: room.id, roomName: room.name });
       st.activity = activity || st.activity;
+      if (room) st.roomId = room.id;
     } else {
       const cur = visits.find((x) => x.id === st.visitId);
       if (cur && !cur.end) {
@@ -483,9 +522,9 @@ export const LifeMixin = {
         cur.endTime = ln.time;
         cur.endDate = ln.date;
       }
-      const v = { id: uid("vs"), placeId: pl.id, placeName: pl.name, kind: pl.kind, activity, start: at, date: ln.date, startTime: ln.time, end: "", by, log: activity ? [{ at, time: ln.time, activity }] : [] };
+      const v = { id: uid("vs"), placeId: pl.id, placeName: pl.name, kind: pl.kind, roomId: room?.id || "", roomName: room?.name || "", activity, start: at, date: ln.date, startTime: ln.time, end: "", by, log: activity || room ? [{ at, time: ln.time, activity, room: room?.name || "" }] : [] };
       visits.push(v);
-      Object.assign(st, { placeId: pl.id, activity, since: at, visitId: v.id });
+      Object.assign(st, { placeId: pl.id, roomId: room?.id || "", activity, since: at, visitId: v.id });
       moved = true;
     }
     st.by = by;
@@ -494,11 +533,12 @@ export const LifeMixin = {
     this.put("map:state", st);
     // 让他在聊天里也知道自己在哪（他自己通过 MCP 挪的就不用再告诉他了）
     const ms = this.mapSettings();
-    if (ms.syncToUranus && by !== "mcp" && (moved || activity)) {
+    if (ms.syncToUranus && by !== "mcp" && (moved || roomChanged || activity)) {
       const name = this.settings().characterName || "The character";
-      this.pushBridge("character_life", `${ln.time} ${name} ${moved ? "is now at" : "is still at"} ${pl.name}${activity ? ` — ${activity}` : ""}.`, { origin: "map_location" }).catch(() => {});
+      const where = `${pl.name}${room ? ` (${room.name})` : ""}`;
+      this.pushBridge("character_life", `${ln.time} ${name} ${moved ? "is now at" : roomChanged ? "moved to" : "is still at"} ${where}${activity ? ` — ${activity}` : ""}.`, { origin: "map_location" }).catch(() => {});
     }
-    return { moved, place: pl, state: st };
+    return { moved, roomChanged, place: pl, room, state: st };
   },
 
   /** 定时器每一跳都调；没到点 / 静默时间 / 没开就什么也不做（不调模型、不花 token） */
@@ -508,6 +548,15 @@ export const LifeMixin = {
     const ln = this.localNow();
     if (inQuiet(ms.quiet, ln.time)) return;
     const st = this.mapState(), now = Date.now();
+    // 你刚换了位置：到点就让他「看到」并决定（离上次判断太近就往后挪一点）
+    if (st.reactAt && now >= st.reactAt) {
+      if (st.lastCheckAt && now - st.lastCheckAt < 15 * 60000) {
+        this.put("map:state", { ...st, reactAt: st.lastCheckAt + 15 * 60000 });
+        return;
+      }
+      await this.mapDecide("user_moved");
+      return;
+    }
     if (st.nextCheckAt && now < st.nextCheckAt) return;
     if (st.lastCheckAt && now - st.lastCheckAt < 25 * 60000) return; // 保险：怎么都不会 25 分钟内连调两次
     await this.mapDecide("scheduled");
@@ -535,21 +584,43 @@ export const LifeMixin = {
         .sort((a, b) => String(a.time || "99").localeCompare(String(b.time || "99")))
         .slice(0, 15)
         .map((x) => `${x.time || "anytime"}${x.end ? `–${x.end}` : ""} ${x.text}${x.status && x.status !== "planned" ? ` [${x.status}]` : ""}`);
-      const placeLines = places.slice(0, 60).map((p) => `${p.id} | ${p.name} | ${p.kind}${p.note ? ` | ${p.note.slice(0, 80)}` : ""}`);
+      const placeLines = places.slice(0, 60).map((p) => `${p.id} | ${p.name} | ${p.kind}${p.note ? ` | ${p.note.slice(0, 80)}` : ""}${p.rooms?.length ? ` | rooms: ${p.rooms.map((r) => r.name).join(", ")}` : ""}`);
+      const curRoom = findRoom(cur, st.roomId);
+      // 她在哪 + 她今天的安排（Companion 里她自己的待办 + DDL Garden）
+      const userName = s.userName || "the user";
+      const meta = this.mapMeta();
+      const herPlace = meta.me?.visible !== false ? places.find((x) => x.id === meta.me?.placeId) : null;
+      const fmtT = (iso) => (iso ? new Date(iso).toLocaleString("en-US", { timeZone: this.tzName(), weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }) : "?");
+      const herSched = this.list("schedule")
+        .filter((x) => x.owner === "user" && x.date === ln.date)
+        .map((x) => `${x.time || "anytime"}${x.end ? `–${x.end}` : ""} ${x.text}${x.status && x.status !== "planned" ? ` [${x.status}]` : ""}`);
+      for (const t of this.get("garden:snap", null)?.tasks || []) if (t.date === ln.date) herSched.push(`${(t.kind === "event" ? t.start : t.time) || "anytime"}${t.end ? `–${t.end}` : ""} ${t.course ? t.course + " · " : ""}${t.title}${t.done ? " [done]" : ""}`);
+      herSched.sort();
+      const reactPlace = reason === "user_moved" ? places.find((x) => x.id === st.reactPlace) : null;
+      const spont = {
+        low: `Stick closely to ${name}'s schedule and usual routine; only move when the schedule or the time of day calls for it.`,
+        normal: `The schedule is a guide, not a script. Between and around plans ${name} lives naturally: errands, a coffee, a walk, moving between rooms at home, sometimes dropping by to see ${userName} when it fits who he is and what he has going on.`,
+        high: `${name} is spontaneous. Besides the schedule he takes detours, wanders, runs errands on a whim, and fairly often decides on impulse to go see ${userName} where she is (if it fits his plans and the time).`,
+      }[ms.spontaneity] || "";
       const persona = ms.usePersona ? String(s.agent?.persona || "").trim().slice(0, 1200) : "";
       const quiet = ms.quiet.map((q) => `${q.start}–${q.end}`).join(", ");
       const sys = [
         `You track where ${name} physically is during the day, like a shared-location app. Decide where ${name} most plausibly is RIGHT NOW and what they are doing.`,
-        `Be realistic and consistent: follow the schedule when there is one, respect the time of day and weekday, don't teleport around for no reason (staying put is often right), and don't invent dramatic events.`,
+        `Be realistic and consistent: respect the time of day and weekday, don't teleport around for no reason (staying put is often right), and don't invent dramatic events. Fixed commitments in the schedule (meetings, classes, appointments) still happen.`,
+        spont,
+        `If the chosen place has rooms, pick the room he is in (people move between rooms at home: kitchen for food, bathroom in the morning, bedroom late at night, etc.).`,
         ms.allowNewPlaces ? `Prefer the known places. Only if none fits, you may create ONE new place (short name, a realistic everyday location).` : `You MUST choose one of the known places.`,
         `${ms.language ? `Write "activity" in ${ms.language}.` : `Write "activity" in the same language as the place names.`} "activity" is a short phrase (max 12 words), e.g. "working on the quarterly report".`,
-        `Reply with ONLY a JSON object: {"placeId": "<id of a known place, or empty>", "newPlace": null | {"name": "...", "kind": "${PLACE_KINDS.join("|")}", "note": "..."}, "activity": "...", "expectedStayMinutes": <number>, "reason": "<one short sentence>"}`,
+        `Reply with ONLY a JSON object: {"placeId": "<id of a known place, or empty>", "newPlace": null | {"name": "...", "kind": "${PLACE_KINDS.join("|")}", "note": "..."}, "room": "<room name of that place, or empty>", "activity": "...", "visitingUser": true|false, "expectedStayMinutes": <number>, "reason": "<one short sentence>"}`,
       ].join("\n");
       const user = [
         persona ? `ABOUT ${name.toUpperCase()}:\n${persona}` : "",
         `NOW: ${weekday} ${ln.date} ${ln.time} (${this.tzName()})`,
         quiet ? `(Overnight quiet hours with no checks: ${quiet}. Whatever you pick may need to last until the next check.)` : "",
-        `CURRENTLY: ${cur ? `${cur.name} (${cur.id}) since ${st.since ? new Date(st.since).toLocaleString("en-US", { timeZone: this.tzName(), weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }) : "?"}${st.activity ? `, ${st.activity}` : ""}` : "unknown"}`,
+        `CURRENTLY: ${cur ? `${cur.name} (${cur.id})${curRoom ? `, in the ${curRoom.name}` : ""}, since ${fmtT(st.since)}${st.activity ? `, ${st.activity}` : ""}` : "unknown"}`,
+        `${userName.toUpperCase()} RIGHT NOW: ${herPlace ? `at ${herPlace.name} (${herPlace.id}) since ${fmtT(meta.me.since)}` : "location not shared"}`,
+        `${userName.toUpperCase()}'S PLANS TODAY:\n${herSched.slice(0, 12).join("\n") || "(nothing listed)"}`,
+        reactPlace ? `TRIGGER: ${userName} just updated her location to ${reactPlace.name} a few minutes ago, and ${name} noticed. Decide whether he does anything about it — going to see her, meeting her nearby, or simply carrying on — whatever fits him, his plans and the time. He does not always come running.` : "",
         `KNOWN PLACES (id | name | kind | note):\n${placeLines.join("\n") || "(none yet)"}`,
         `${name.toUpperCase()}'S SCHEDULE TODAY:\n${sched.join("\n") || "(nothing scheduled)"}`,
         `RECENT MOVEMENTS:\n${recent.join("\n") || "(none)"}`,
@@ -566,16 +637,18 @@ export const LifeMixin = {
       }
       if (!pid && d.newPlace && ms.allowNewPlaces) pid = this.mapAddPlace({ name: d.newPlace.name, kind: d.newPlace.kind, note: d.newPlace.note }, "character").id;
       if (!pid) throw new Error("模型没选出有效的地点：" + out.slice(0, 160));
-      const r = await this.mapMoveTo(pid, str(d.activity, 160), "model", str(d.reason, 300));
+      const r = await this.mapMoveTo(pid, str(d.activity, 160), "model", str(d.reason, 300), str(d.room, 40));
       const stay = Number(d.expectedStayMinutes);
       const next = Number.isFinite(stay) && stay > 0 ? plan(Math.max(ms.minHours, Math.min(ms.maxHours, stay / 60))) : randomNext();
       const st2 = this.mapState();
-      this.put("map:state", { ...st2, lastCheckAt: now, nextCheckAt: next, lastError: "" });
-      return { ok: true, ...r, reason: str(d.reason, 300), nextCheckAt: next };
+      // 被你触发的那次不打乱原来的节奏：下次常规检查不早于原定时间
+      const keep = reason === "user_moved" && st.nextCheckAt > now ? Math.max(st.nextCheckAt, next) : next;
+      this.put("map:state", { ...st2, lastCheckAt: now, nextCheckAt: keep, lastError: "", reactAt: 0, reactPlace: "" });
+      return { ok: true, ...r, reason: str(d.reason, 300), nextCheckAt: keep, visitingUser: !!d.visitingUser };
     } catch (e) {
       const st2 = this.mapState();
       // 出错 30 分钟后再试，不要每 10 分钟都去撞
-      this.put("map:state", { ...st2, lastCheckAt: now, nextCheckAt: now + 30 * 60000, lastError: `${new Date().toISOString()} ${String(e.message || e).slice(0, 300)}` });
+      this.put("map:state", { ...st2, lastCheckAt: now, reactAt: 0, reactPlace: "", nextCheckAt: now + 30 * 60000, lastError: `${new Date().toISOString()} ${String(e.message || e).slice(0, 300)}` });
       try {
         this.add("notifications", { id: uid("n"), text: `地图位置更新失败（${reason}）：${String(e.message || e).slice(0, 200)}`, read: false, createdAt: nowIso(), activityDate: this.localDate() });
       } catch {}
@@ -594,12 +667,17 @@ export const LifeMixin = {
       {
         name: "move_to",
         description: "Update YOUR location on the shared map when you actually go somewhere (or update what you're doing where you are). Use a known placeId, or give placeName; an unknown placeName creates a new place. Only call this when your location really changes in the story — don't move around just to show off.",
-        inputSchema: { type: "object", properties: { placeId: { type: "string" }, placeName: { type: "string" }, kind: { type: "string", enum: PLACE_KINDS }, activity: { type: "string", description: "short phrase: what you're doing there" } } },
+        inputSchema: { type: "object", properties: { placeId: { type: "string" }, placeName: { type: "string" }, kind: { type: "string", enum: PLACE_KINDS }, room: { type: "string", description: "optional: room inside that place (e.g. kitchen at home); unknown room names are added" }, activity: { type: "string", description: "short phrase: what you're doing there" } } },
       },
       {
         name: "add_place",
         description: "Add a place you go to (home, office, a café you like…) to the shared map without moving there.",
         inputSchema: { type: "object", properties: { name: { type: "string" }, kind: { type: "string", enum: PLACE_KINDS }, note: { type: "string" } }, required: ["name"] },
+      },
+      {
+        name: "add_room",
+        description: "Add a room / area inside a place (e.g. bedroom, kitchen, bathroom at home; meeting room at the office). Rooms show up on the place's floor plan.",
+        inputSchema: { type: "object", properties: { placeId: { type: "string" }, placeName: { type: "string" }, name: { type: "string" }, icon: { type: "string", description: "one emoji, optional" } }, required: ["name"] },
       },
       {
         name: "update_place",
@@ -620,15 +698,19 @@ export const LifeMixin = {
   },
   async lifeMcpCall(name, a) {
     const ln = this.localNow();
-    const placeOut = (p) => p && { id: p.id, name: p.name, kind: p.kind, note: p.note || "", addedBy: p.by };
+    const placeOut = (p) => p && { id: p.id, name: p.name, kind: p.kind, note: p.note || "", addedBy: p.by, ...(p.rooms?.length ? { rooms: p.rooms.map((r) => r.name) } : {}) };
     if (name === "get_my_location") {
       const st = this.mapState(), places = this.mapPlaces();
       const cur = places.find((x) => x.id === st.placeId);
       return {
         now: `${ln.date} ${ln.time}`,
         timezone: this.tzName(),
-        current: cur ? { place: placeOut(cur), activity: st.activity, since: st.since } : null,
-        todayTrail: this.list("mapVisits").filter((v) => v.date === ln.date || (!v.end && v.id === st.visitId)).map((v) => ({ place: v.placeName, from: v.startTime, to: v.end ? v.endTime : "now", activity: v.activity })),
+        current: cur ? { place: placeOut(cur), room: findRoom(cur, st.roomId)?.name || "", activity: st.activity, since: st.since } : null,
+        user: (() => {
+          const m = this.mapMeta(), hp = m.me?.visible !== false ? places.find((x) => x.id === m.me?.placeId) : null;
+          return hp ? { name: this.settings().userName, at: hp.name, since: m.me.since || "" } : { name: this.settings().userName, at: null, note: "She hasn't shared her location on the map." };
+        })(),
+        todayTrail: this.list("mapVisits").filter((v) => v.date === ln.date || (!v.end && v.id === st.visitId)).map((v) => ({ place: v.placeName, room: v.roomName || "", from: v.startTime, to: v.end ? v.endTime : "now", activity: v.activity })),
         places: places.map(placeOut),
       };
     }
@@ -640,11 +722,23 @@ export const LifeMixin = {
         if (!this.mapSettings().allowNewPlaces) throw new Error("New places are disabled; pick one of the known places (see get_my_location).");
         pl = this.mapAddPlace({ name: a.placeName, kind: a.kind }, "character");
       }
-      const r = await this.mapMoveTo(pl.id, str(a.activity, 160), "mcp");
+      let roomKey = str(a.room, 30);
+      if (roomKey && !findRoom(pl, roomKey)) {
+        this.mapUpdatePlace(pl.id, { rooms: [...(pl.rooms || []), { name: roomKey }] }, "character");
+        pl = this.mapPlaces().find((x) => x.id === pl.id);
+      }
+      const r = await this.mapMoveTo(pl.id, str(a.activity, 160), "mcp", "", roomKey);
       // 自己挪了之后，定时检查往后推一推，别刚挪完就被模型又挪走
       const ms = this.mapSettings(), st = this.mapState();
       this.put("map:state", { ...st, nextCheckAt: Date.now() + Math.round(ms.minHours * 3600000) });
-      return { ok: true, moved: r.moved, place: placeOut(pl), activity: r.state.activity };
+      return { ok: true, moved: r.moved, place: placeOut(pl), room: r.room?.name || "", activity: r.state.activity };
+    }
+    if (name === "add_room") {
+      const places = this.mapPlaces();
+      const pl = places.find((x) => x.id === str(a.placeId, 80)) || places.find((x) => normName(x.name) === normName(a.placeName));
+      if (!pl) throw new Error("Unknown place; give placeId from get_my_location.");
+      const upd = this.mapUpdatePlace(pl.id, { rooms: [...(pl.rooms || []), { name: a.name, icon: a.icon }] }, "character");
+      return { ok: true, place: placeOut(upd) };
     }
     if (name === "add_place") return { ok: true, place: placeOut(this.mapAddPlace(a, "character")) };
     if (name === "update_place") return { ok: true, place: placeOut(this.mapUpdatePlace(str(a.id, 80), { name: a.name, kind: a.kind, note: a.note }, "character")) };
