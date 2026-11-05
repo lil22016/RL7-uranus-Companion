@@ -788,6 +788,20 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
   musicLyrics(b){const ctx=String(b.lyrics||"").slice(0,900).trim(),line=String(b.lyricLine||"").slice(0,200);
     if(ctx)return `\nLyrics around this moment (the line marked ▶ is being sung right now; lines above were just sung, lines below are coming next):\n${ctx}\n`;
     return line?`; the current lyric line is: "${line}"`:"";}
+  /** 解析「听歌反应」的模型输出。返回 {text,attitude,skip}；输出被截断、拿不到完整的一句话时返回 null。 */
+  musicParse(out){
+    const raw=String(out||"").trim();
+    const o=this.loose(raw);
+    if(o&&typeof o==="object"&&!Array.isArray(o))return o;
+    // 模型没按 JSON 回、直接说了句话：就当这句话是反应
+    if(raw&&!/^(```|\{)/.test(raw))return {text:raw,attitude:"none"};
+    // JSON 坏了（多半是尾巴被截断），但 "text" 那句已经完整写完了：只捞那一句
+    const m=raw.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if(!m)return null;
+    let text;try{text=JSON.parse(`"${m[1]}"`)}catch{text=m[1]}
+    const att=(raw.match(/"attitude"\s*:\s*"(like|dislike|none)"/)||[])[1]||"none";
+    return {text,attitude:att,skip:/"skip"\s*:\s*true/.test(raw)};
+  }
   async musicReact(req){
     const b=await this.body(req),song=this.cleanSong(b.song),cfg=this.musicCfg();
     if(!song.id)return j({ok:false,error:"song required"},400);
@@ -795,8 +809,14 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
     const lyr=this.musicLyrics(b);const asked=!!b.asked;const uname=this.settings().userName||"The user";
     const askLine=asked?` ${uname} just turned to you and asked what you think of this song. Answer her honestly in your own voice (one or two short sentences), and commit to "like" or "dislike" unless you truly feel neutral about it.`:"";
     const sys=this.musicSystem(`You are listening to "${song.name}" by ${song.artist||"unknown"} (at ${pos}s)${lyr}${askLine} React to what you're actually hearing (the lyrics around this moment, the song, the mood) the way YOU would, briefly: one or two short sentences at most, no emojis spam. ${prior==="dislike"?"You already disliked this song before, so you lean strongly towards skipping it and say so. ":prior==="like"?"You already liked this song before. ":""}You may also decide whether you like or dislike this song (only if you really feel it; otherwise "none")${allowSkip?", and you may ask to skip it if it truly isn't for you":""}.\nReturn ONLY JSON: {"text":"your short reaction","attitude":"like|dislike|none","skip":false}`);
-    let out;try{out=await this.callLLM(cfg,[{role:"system",content:sys},{role:"user",content:"React now."}],300)}catch(e){return j({ok:false,error:String(e.message||e)},400)}
-    let o={};try{o=JSON.parse(out.replace(/^```json\s*|\s*```$/g,""))}catch{o={text:out.slice(0,200),attitude:"none"}}
+    /* 模型回的 JSON 可能被截断（思考型模型会先吃掉 token）。解析不了就重试一次；
+       两次都不行就这次不说话 —— 绝不把半截 {"text":"… 原样发出去。 */
+    let o=null;
+    for(let i=0;i<2&&!o;i++){
+      let out;try{out=await this.callLLM(cfg,[{role:"system",content:sys},{role:"user",content:"React now."}],1200)}catch(e){if(i)return j({ok:false,error:String(e.message||e)},400);continue}
+      o=this.musicParse(out);
+    }
+    o=o||{text:"",attitude:"none"};
     const skip=allowSkip&&(o.skip===true||prior==="dislike"),text=(b.wantText===false&&!skip)?"":String(o.text||"").trim().slice(0,300),att=(b.wantAttitude!==false&&["like","dislike"].includes(o.attitude))?o.attitude:"none";
     if(text)this.add("music:chat",{id:id("mc"),role:"character",text,song,at:nowIso(),kind:"react"});
     if(att!=="none")this.setAttitude(song,att,"character");
@@ -810,7 +830,7 @@ Return JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reacti
     const hist=this.list("music:chat").slice(-12).map(m=>({role:m.role==="user"?"user":"assistant",content:m.text}));
     const line=String(b.lyricLine||"").slice(0,200);
     const sys=this.musicSystem(`You are chatting in a tiny music-room chat box about music only (the song, lyrics, taste, mood). ${song.id?`Now playing: "${song.name}" by ${song.artist||"unknown"}.${this.musicLyrics(b)}`:"Nothing is playing right now."} Keep every reply SHORT (one or two sentences). Plain text only, no JSON.`);
-    let out;try{out=await this.callLLM(cfg,[{role:"system",content:sys},...hist],300)}catch(e){return j({ok:false,error:String(e.message||e)},400)}
+    let out;try{out=await this.callLLM(cfg,[{role:"system",content:sys},...hist],1200)}catch(e){return j({ok:false,error:String(e.message||e)},400)}
     const reply=out.replace(/^```\w*\s*|\s*```$/g,"").trim().slice(0,400);
     if(reply)this.add("music:chat",{id:id("mc"),role:"character",text:reply,song,at:nowIso(),kind:"chat"});
     this.save("music:chat",this.list("music:chat").slice(-80));
