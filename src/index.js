@@ -92,7 +92,7 @@ export class Companion extends DurableObject {
     if(p==="/api/session/simplify"&&m==="POST") return this.simplifySession();
     if(p==="/api/session/simplified"&&m==="PUT") return this.saveSimplifiedSession(req);
     if(p==="/api/session/commit"&&m==="POST") return this.commitSession(req);
-    if(p.startsWith("/api/period")||p.startsWith("/api/focus")||p.startsWith("/api/map")){ const r=await this.lifeRoute(req,p,m); if(r)return r; }
+    if(p.startsWith("/api/period")||p.startsWith("/api/focus")||p.startsWith("/api/map")||p.startsWith("/api/glass")){ const r=await this.lifeRoute(req,p,m); if(r)return r; }
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
   }

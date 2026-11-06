@@ -208,6 +208,10 @@ export const LifeMixin = {
       this.save("mapVisits", this.list("mapVisits").filter((x) => x.id !== vid));
       return j({ ok: true });
     }
+
+    if (p === "/api/glass" && m === "GET") return this.glassGet();
+    if (p === "/api/glass/cfg" && m === "PUT") return this.glassCfgPut(req);
+    if (p === "/api/glass/session" && m === "POST") return this.glassSession(req);
     return null;
   },
 
@@ -335,6 +339,103 @@ export const LifeMixin = {
       }
     }
     return j({ ok: true, item });
+  },
+
+  /* ═════════════ 雾玻璃 ═════════════ */
+  /*
+   * glass:cfg = {
+   *   lines:{bucket:[…]}  只存改过的那几类，没有的用前端自带的默认句子库
+   *   kinds:{text,hand,lips,knock}  他用哪几种方式回应
+   *   often: rare | normal | always   多久回应一次
+   *   sound, tellCharacter
+   *   bgDefault: 图片 id（空 = 用自带的那张）
+   *   followPlace: 背景跟着他在地图上的位置走
+   *   bg:{placeId: 图片 id}
+   * }
+   */
+  glassCfg() {
+    const c = this.get("glass:cfg", null) || {};
+    return {
+      lines: c.lines && typeof c.lines === "object" ? c.lines : {},
+      kinds: { text: true, hand: true, lips: true, knock: true, ...(c.kinds || {}) },
+      often: ["rare", "normal", "always"].includes(c.often) ? c.often : "normal",
+      sound: c.sound !== false,
+      tellCharacter: c.tellCharacter !== false,
+      bgDefault: str(c.bgDefault, 80),
+      followPlace: !!c.followPlace,
+      bg: c.bg && typeof c.bg === "object" ? c.bg : {},
+    };
+  },
+  glassGet() {
+    const st = this.settings(), ms = this.mapState();
+    const places = this.mapPlaces().map((x) => ({ id: x.id, name: x.name, kind: x.kind }));
+    const here = places.find((x) => x.id === ms.placeId);
+    return j({ ok: true, cfg: this.glassCfg(), places, here: here ? { id: here.id, name: here.name } : null, now: this.localNow(), characterName: st.characterName, userName: st.userName });
+  },
+  async glassCfgPut(req) {
+    const b = await this.body(req), o = this.glassCfg(), n = { ...o };
+    if (b.lines && typeof b.lines === "object") {
+      n.lines = {};
+      for (const [k, v] of Object.entries(b.lines).slice(0, 20)) {
+        if (!/^[a-z]{2,16}$/.test(k) || !Array.isArray(v)) continue;
+        n.lines[k] = v.map((x) => str(x, 160)).filter(Boolean).slice(0, 300);
+      }
+    }
+    if (b.kinds && typeof b.kinds === "object") for (const k of ["text", "hand", "lips", "knock"]) if (b.kinds[k] !== undefined) n.kinds = { ...n.kinds, [k]: !!b.kinds[k] };
+    if (["rare", "normal", "always"].includes(b.often)) n.often = b.often;
+    for (const k of ["sound", "tellCharacter", "followPlace"]) if (b[k] !== undefined) n[k] = !!b[k];
+    const drop = (oldId, newId) => {
+      if (oldId && oldId !== newId) {
+        try {
+          this.deleteImage(oldId);
+        } catch {}
+      }
+    };
+    if (b.bgDefault !== undefined) {
+      drop(o.bgDefault, str(b.bgDefault, 80));
+      n.bgDefault = str(b.bgDefault, 80);
+    }
+    if (b.bg && typeof b.bg === "object") {
+      const next = { ...o.bg };
+      for (const [pid, iid] of Object.entries(b.bg).slice(0, 80)) {
+        const k = str(pid, 80), v = str(iid, 80);
+        if (!k) continue;
+        drop(o.bg[k], v);
+        if (v) next[k] = v;
+        else delete next[k];
+      }
+      n.bg = next;
+    }
+    this.put("glass:cfg", n);
+    return j({ ok: true, cfg: n });
+  },
+  /** 一次「在玻璃前待着」的整段：敲了几次、划了几下、他回了什么。整段只推一条，不是敲一下推一下。 */
+  async glassSession(req) {
+    const b = await this.body(req);
+    const knocks = num(b.knocks, 0, 999, 0), wipes = num(b.wipes, 0, 999, 0), taps = num(b.taps, 0, 9999, 0);
+    if (!knocks && !wipes && !taps) return j({ ok: true, skipped: true });
+    const cfg = this.glassCfg();
+    if (!cfg.tellCharacter) return j({ ok: true, skipped: true });
+    const st = this.settings(), user = st.userName || "The user", name = st.characterName || "He";
+    const fmt = (iso) => {
+      try {
+        return new Intl.DateTimeFormat("en-GB", { timeZone: this.tzName(), hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso));
+      } catch {
+        return "";
+      }
+    };
+    const from = fmt(b.startedAt), to = fmt(b.endedAt || nowIso());
+    const mins = Math.max(1, Math.round((Date.parse(b.endedAt || nowIso()) - Date.parse(b.startedAt || nowIso())) / 60000) || 1);
+    const did = [];
+    if (knocks) did.push(`knocked on it ${knocks} time${knocks > 1 ? "s" : ""}`);
+    if (wipes) did.push(`wiped the fog with her finger ${wipes} time${wipes > 1 ? "s" : ""}`);
+    if (!knocks && taps) did.push(`tapped it ${taps} time${taps > 1 ? "s" : ""}`);
+    const label = { hand: "pressed his hand against the glass", lips: "left a kiss print on the glass", knock: "knocked back" };
+    const replies = (Array.isArray(b.replies) ? b.replies : []).slice(0, 12).map((r) => (r?.kind === "text" ? `wrote "${str(r.text, 160)}"` : label[r?.kind] || "")).filter(Boolean);
+    let text = `${user} spent about ${mins} min at the fogged glass between you two (${from && to && from !== to ? `${from}–${to}` : from || to}) looking for ${name}: she ${did.join(" and ")}.`;
+    if (replies.length) text += ` From the other side, ${name} ${replies.join("; ")}.`;
+    this.pushBridge("user_life", text, { origin: "fog_glass" }).catch(() => {});
+    return j({ ok: true, text });
   },
 
   /* ═════════════ 地图 ═════════════ */
