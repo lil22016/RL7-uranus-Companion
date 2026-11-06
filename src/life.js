@@ -359,6 +359,8 @@ export const LifeMixin = {
       lines: c.lines && typeof c.lines === "object" ? c.lines : {},
       kinds: { text: true, hand: true, lips: true, knock: true, ...(c.kinds || {}) },
       often: ["rare", "normal", "always"].includes(c.often) ? c.often : "normal",
+      linger: ["short", "normal", "long"].includes(c.linger) ? c.linger : "normal",
+      ranges: c.ranges && typeof c.ranges === "object" ? c.ranges : {},
       sound: c.sound !== false,
       tellCharacter: c.tellCharacter !== false,
       bgDefault: str(c.bgDefault, 80),
@@ -383,6 +385,12 @@ export const LifeMixin = {
     }
     if (b.kinds && typeof b.kinds === "object") for (const k of ["text", "hand", "lips", "knock"]) if (b.kinds[k] !== undefined) n.kinds = { ...n.kinds, [k]: !!b.kinds[k] };
     if (["rare", "normal", "always"].includes(b.often)) n.often = b.often;
+    if (["short", "normal", "long"].includes(b.linger)) n.linger = b.linger;
+    if (b.ranges && typeof b.ranges === "object") {
+      const ok = (t) => /^([01]\d|2[0-4]):[0-5]\d$/.test(String(t || ""));
+      n.ranges = {};
+      for (const [k, r] of Object.entries(b.ranges).slice(0, 20)) if (/^[a-z]{2,16}$/.test(k) && ok(r?.from) && ok(r?.to)) n.ranges[k] = { from: r.from, to: r.to };
+    }
     for (const k of ["sound", "tellCharacter", "followPlace"]) if (b[k] !== undefined) n[k] = !!b[k];
     const drop = (oldId, newId) => {
       if (oldId && oldId !== newId) {
