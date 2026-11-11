@@ -51,6 +51,8 @@ export const MAP_DEFAULTS = {
   language: "",
   spontaneity: "normal", // low | normal | high：日程之外他有多「随性」
   reactToUser: true, // 你在地图上换了位置 → 过一会儿让他「看到」，自己决定要不要过来
+  pastDaysEnabled: true, // 判断时给不给他看前几天的行程（标明「别照着重复」）；今天的行程不受影响，一直给
+  pastDays: 3, // 给几天（1–7）
 };
 
 export const PLACE_KINDS = ["home", "work", "study", "cafe", "food", "shop", "park", "gym", "bar", "friend", "transit", "culture", "other"];
@@ -452,6 +454,8 @@ export const LifeMixin = {
     m.minHours = num(m.minHours, 0.5, 12, 2);
     m.maxHours = num(m.maxHours, m.minHours, 24, Math.max(3, m.minHours));
     m.quiet = (Array.isArray(m.quiet) ? m.quiet : []).filter((q) => hhmm(q?.start) && hhmm(q?.end)).slice(0, 4);
+    m.pastDaysEnabled = m.pastDaysEnabled !== false;
+    m.pastDays = Math.round(num(m.pastDays, 1, 7, 3));
     return m;
   },
   mapState() {
@@ -490,7 +494,8 @@ export const LifeMixin = {
     const all = this.get("settings", {});
     const cur = { ...MAP_DEFAULTS, ...(all.map || {}) };
     const n = { ...cur };
-    for (const k of ["enabled", "syncToUranus", "allowNewPlaces", "usePersona", "reactToUser"]) if (b[k] !== undefined) n[k] = !!b[k];
+    for (const k of ["enabled", "syncToUranus", "allowNewPlaces", "usePersona", "reactToUser", "pastDaysEnabled"]) if (b[k] !== undefined) n[k] = !!b[k];
+    if (b.pastDays !== undefined) n.pastDays = Math.round(num(b.pastDays, 1, 7, 3));
     if (["low", "normal", "high"].includes(b.spontaneity)) n.spontaneity = b.spontaneity;
     for (const k of ["source", "profileId", "uranusProviderId", "model", "language"]) if (b[k] !== undefined) n[k] = str(b[k], 200);
     if (b.minHours !== undefined) n.minHours = num(b.minHours, 0.5, 12, 2);
@@ -695,7 +700,7 @@ export const LifeMixin = {
       // 今天走过的地方（保持连贯）；前几天的单独列，明确告诉模型别照着重复——
       // 以前把最近 8 段（大多是昨天）直接给它，它会把昨天的路线原样再走一遍，一天天固化成同一套流程
       const recent = visits.filter((v) => v.date === ln.date || v.id === st.visitId).slice(-10).map((v) => `${v.startTime}${v.end ? `–${v.endTime}` : "–now"} ${v.placeName}${v.roomName ? ` (${v.roomName})` : ""}${v.activity ? ` — ${v.activity}` : ""}`);
-      const pastDays = [1, 2, 3]
+      const pastDays = (ms.pastDaysEnabled ? Array.from({ length: ms.pastDays }, (_, i) => i + 1) : [])
         .map((k) => {
           const d = new Date(Date.parse(ln.date + "T12:00:00Z") - k * 86400000).toISOString().slice(0, 10);
           const vs = visits.filter((v) => v.date === d);
@@ -733,7 +738,7 @@ export const LifeMixin = {
         `You track where ${name} physically is during the day, like a shared-location app. Decide where ${name} most plausibly is RIGHT NOW and what they are doing.`,
         `Be realistic and consistent: respect the time of day and weekday, don't teleport around for no reason (staying put is often right), and don't invent dramatic events. Fixed commitments in the schedule (meetings, classes, appointments) still happen.`,
         spont,
-        `VARIETY MATTERS: a real person's days are not copies of each other. Look at PREVIOUS DAYS and do NOT replay the same routine (the same morning ritual, the same food/tea/dessert run, the same shop, the same evening) unless the schedule or a real reason calls for it. Let the weekday, his persona, his obligations and interests, and what ${userName} is up to shape today differently. Vary the activities too, not just the places.`,
+        `VARIETY MATTERS: a real person's days are not copies of each other. ${ms.pastDaysEnabled ? "Look at PREVIOUS DAYS and do" : "Do"} NOT replay the same routine (the same morning ritual, the same food/tea/dessert run, the same shop, the same evening) unless the schedule or a real reason calls for it. Let the weekday, his persona, his obligations and interests, and what ${userName} is up to shape today differently. Vary the activities too, not just the places.`,
         `If the chosen place has rooms, pick the room that fits what he is doing.`,
         ms.allowNewPlaces ? `Use the known places when they fit, but when his day would naturally take him somewhere that isn't listed (a market, a gallery, a friend's place, a park, a restaurant…), create ONE new place (short name, a realistic location) instead of falling back to the same few places.` : `You MUST choose one of the known places.`,
         `${ms.language ? `Write "activity" in ${ms.language}.` : `Write "activity" in the same language as the place names.`} "activity" is a short phrase (max 12 words), e.g. "working on the quarterly report".`,
