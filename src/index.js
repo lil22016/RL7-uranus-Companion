@@ -1525,7 +1525,7 @@ Return ONLY JSON: {"posts":[{"ref":"exact ref","text":"...","imagePrompt":"..."}
     if(!text)return {ok:false,error:"Nothing to push"};
     const url=this.bridgeUrl(b.url);
     try{
-      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","x-uranus-key":b.key||""},body:JSON.stringify({id:meta.packetId||crypto.randomUUID(),packetId:meta.packetId||null,eventIds:Array.isArray(meta.eventIds)?meta.eventIds:[],type,text,characterName:s.characterName,userName:s.userName,maxContextChars:b.maxContextChars,actor:meta.actor||((type==="character_summary"||type==="character_life")?"character":"user"),source:meta.source||"companion",origin:meta.origin||((type==="character_summary")?"companion_agent":"companion_ui"),createdAt:nowIso()})});
+      const r=await fetch(url,{method:"POST",headers:{"content-type":"application/json","x-uranus-key":b.key||""},body:JSON.stringify({id:meta.packetId||crypto.randomUUID(),packetId:meta.packetId||null,eventIds:Array.isArray(meta.eventIds)?meta.eventIds:[],type,text,characterName:s.characterName,userName:s.userName,maxContextChars:b.maxContextChars,actor:meta.actor||((type==="character_summary"||type==="character_life")?"character":"user"),source:meta.source||"companion",origin:meta.origin||((type==="character_summary")?"companion_agent":"companion_ui"),replace:!!meta.replace,createdAt:nowIso()})});
       const responseText=(await r.text()).slice(0,2000); let response=null; try{response=JSON.parse(responseText)}catch{}
       if(!r.ok)return {ok:false,status:r.status,url,error:`Uranus returned HTTP ${r.status}${responseText?`: ${responseText.slice(0,500)}`:""}`};
       return {ok:true,status:r.status,url,response,accepted:response?.accepted===true,packetId:String(response?.packetId||"")};

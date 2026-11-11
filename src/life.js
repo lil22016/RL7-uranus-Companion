@@ -335,7 +335,7 @@ export const LifeMixin = {
       if (Date.now() - last > 20 * 60000) {
         this.put("focus:lastPush", Date.now());
         const st = this.settings();
-        this.pushBridge("user_life", `${st.userName || "The user"} finished a ${minutes}-min focus session at ${item.end}${item.task ? ` (${item.task})` : ""}. Today so far: ${todays.length} session${todays.length > 1 ? "s" : ""}, ${total} min.`, { origin: "focus_timer" }).catch(() => {});
+        this.pushBridge("user_life", `${st.userName || "The user"} finished a ${minutes}-min focus session at ${item.end}${item.task ? ` (${item.task})` : ""}. Today so far: ${todays.length} session${todays.length > 1 ? "s" : ""}, ${total} min.`, { origin: "focus_timer", replace: true }).catch(() => {});
       }
     }
     return j({ ok: true, item });
@@ -649,7 +649,8 @@ export const LifeMixin = {
     if (ms.syncToUranus && by !== "mcp" && (moved || roomChanged || activity)) {
       const name = this.settings().characterName || "The character";
       const where = `${pl.name}${room ? ` (${room.name})` : ""}`;
-      this.pushBridge("character_life", `${ln.time} ${name} ${moved ? "is now at" : roomChanged ? "moved to" : "is still at"} ${where}${activity ? ` — ${activity}` : ""}.`, { origin: "map_location" }).catch(() => {});
+      // 只保留最新一条（replace）：这是「他现在在哪」的状态，不是要累积的日志
+      this.pushBridge("character_life", `[Shared map, as of ${ln.date} ${ln.time}] ${name} is at ${where}${activity ? ` — ${activity}` : ""}.`, { origin: "map_location", replace: true }).catch(() => {});
     }
     return { moved, roomChanged, place: pl, room, state: st };
   },
@@ -691,7 +692,18 @@ export const LifeMixin = {
       const name = s.characterName || "the character";
       const cur = places.find((x) => x.id === st.placeId);
       const visits = this.list("mapVisits");
-      const recent = visits.slice(-8).map((v) => `${v.date} ${v.startTime}${v.end ? `–${v.endTime}` : "–now"} ${v.placeName}${v.activity ? ` (${v.activity})` : ""}`);
+      // 今天走过的地方（保持连贯）；前几天的单独列，明确告诉模型别照着重复——
+      // 以前把最近 8 段（大多是昨天）直接给它，它会把昨天的路线原样再走一遍，一天天固化成同一套流程
+      const recent = visits.filter((v) => v.date === ln.date || v.id === st.visitId).slice(-10).map((v) => `${v.startTime}${v.end ? `–${v.endTime}` : "–now"} ${v.placeName}${v.roomName ? ` (${v.roomName})` : ""}${v.activity ? ` — ${v.activity}` : ""}`);
+      const pastDays = [1, 2, 3]
+        .map((k) => {
+          const d = new Date(Date.parse(ln.date + "T12:00:00Z") - k * 86400000).toISOString().slice(0, 10);
+          const vs = visits.filter((v) => v.date === d);
+          if (!vs.length) return "";
+          const wd = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "short" }).format(new Date(d + "T12:00:00Z"));
+          return `${wd} ${d}: ${vs.map((v) => `${v.placeName}${v.activity ? ` (${v.activity.slice(0, 40)})` : ""}`).join(" → ")}`;
+        })
+        .filter(Boolean);
       const sched = this.list("schedule")
         .filter((x) => x.owner === "character" && x.date === ln.date)
         .sort((a, b) => String(a.time || "99").localeCompare(String(b.time || "99")))
@@ -712,7 +724,7 @@ export const LifeMixin = {
       const reactPlace = reason === "user_moved" ? places.find((x) => x.id === st.reactPlace) : null;
       const spont = {
         low: `Stick closely to ${name}'s schedule and usual routine; only move when the schedule or the time of day calls for it.`,
-        normal: `The schedule is a guide, not a script. Between and around plans ${name} lives naturally: errands, a coffee, a walk, moving between rooms at home, sometimes dropping by to see ${userName} when it fits who he is and what he has going on.`,
+        normal: `The schedule is a guide, not a script. Between and around plans ${name} lives naturally — work and obligations, errands, people, hobbies, going out somewhere — and sometimes drops by to see ${userName} when it fits who he is and what he has going on.`,
         high: `${name} is spontaneous. Besides the schedule he takes detours, wanders, runs errands on a whim, and fairly often decides on impulse to go see ${userName} where she is (if it fits his plans and the time).`,
       }[ms.spontaneity] || "";
       const persona = ms.usePersona ? String(s.agent?.persona || "").trim().slice(0, 1200) : "";
@@ -721,8 +733,9 @@ export const LifeMixin = {
         `You track where ${name} physically is during the day, like a shared-location app. Decide where ${name} most plausibly is RIGHT NOW and what they are doing.`,
         `Be realistic and consistent: respect the time of day and weekday, don't teleport around for no reason (staying put is often right), and don't invent dramatic events. Fixed commitments in the schedule (meetings, classes, appointments) still happen.`,
         spont,
-        `If the chosen place has rooms, pick the room he is in (people move between rooms at home: kitchen for food, bathroom in the morning, bedroom late at night, etc.).`,
-        ms.allowNewPlaces ? `Prefer the known places. Only if none fits, you may create ONE new place (short name, a realistic everyday location).` : `You MUST choose one of the known places.`,
+        `VARIETY MATTERS: a real person's days are not copies of each other. Look at PREVIOUS DAYS and do NOT replay the same routine (the same morning ritual, the same food/tea/dessert run, the same shop, the same evening) unless the schedule or a real reason calls for it. Let the weekday, his persona, his obligations and interests, and what ${userName} is up to shape today differently. Vary the activities too, not just the places.`,
+        `If the chosen place has rooms, pick the room that fits what he is doing.`,
+        ms.allowNewPlaces ? `Use the known places when they fit, but when his day would naturally take him somewhere that isn't listed (a market, a gallery, a friend's place, a park, a restaurant…), create ONE new place (short name, a realistic location) instead of falling back to the same few places.` : `You MUST choose one of the known places.`,
         `${ms.language ? `Write "activity" in ${ms.language}.` : `Write "activity" in the same language as the place names.`} "activity" is a short phrase (max 12 words), e.g. "working on the quarterly report".`,
         `Reply with ONLY a JSON object: {"placeId": "<id of a known place, or empty>", "newPlace": null | {"name": "...", "kind": "${PLACE_KINDS.join("|")}", "note": "..."}, "room": "<room name of that place, or empty>", "activity": "...", "visitingUser": true|false, "expectedStayMinutes": <number>, "reason": "<one short sentence>"}`,
       ].join("\n");
@@ -736,7 +749,8 @@ export const LifeMixin = {
         reactPlace ? `TRIGGER: ${userName} just updated her location to ${reactPlace.name} a few minutes ago, and ${name} noticed. Decide whether he does anything about it — going to see her, meeting her nearby, or simply carrying on — whatever fits him, his plans and the time. He does not always come running.` : "",
         `KNOWN PLACES (id | name | kind | note):\n${placeLines.join("\n") || "(none yet)"}`,
         `${name.toUpperCase()}'S SCHEDULE TODAY:\n${sched.join("\n") || "(nothing scheduled)"}`,
-        `RECENT MOVEMENTS:\n${recent.join("\n") || "(none)"}`,
+        `TODAY SO FAR:\n${recent.join("\n") || "(nothing yet today)"}`,
+        pastDays.length ? `PREVIOUS DAYS (already happened — for variety; do NOT copy these routines):\n${pastDays.join("\n")}` : "",
       ]
         .filter(Boolean)
         .join("\n\n");
