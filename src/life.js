@@ -243,15 +243,28 @@ export const LifeMixin = {
       tellCharacter: s.tellCharacter === undefined ? old.settings.tellCharacter !== false : !!s.tellCharacter,
     };
     this.put("period:data", { records: uniq.slice(-400), settings });
-    // 新记了一次「今天 / 昨天开始」的经期 → 让他知道（只是背景，不会逼他回消息）
+    // 「今天来了」/「今天结束了」：像你给他朋友圈点赞一样，立刻作为你的动作发给 Uranus（他收到后可能会回你消息）。
+    // 只有这两个按了才发；补记以前的、导入、记每天的感受都不发。同一天同一件事只发一次。
+    let told = false;
     const today = this.localDate();
-    if (settings.tellCharacter) {
-      const oldStarts = new Set(old.records.map((r) => r.startDate));
-      const fresh = uniq.find((r) => !oldStarts.has(r.startDate) && dayDiff(r.startDate, today) >= 0 && dayDiff(r.startDate, today) <= 1);
-      if (fresh) {
-        const st = this.settings();
-        this.pushBridge("user_life", `${st.userName || "The user"}'s period started ${fresh.startDate === today ? "today" : "yesterday"} (${fresh.startDate}).`, { origin: "period_tracker" }).catch(() => {});
+    const ev = ["start", "end"].includes(b.event) ? b.event : "";
+    if (ev && settings.tellCharacter) {
+      const rec = ev === "start" ? uniq.find((r) => r.startDate === today) : uniq.find((r) => r.endDate === today && r.startDate <= today);
+      const key = `${ev}:${today}`;
+      if (rec && this.get("period:lastEvent", "") !== key) {
+        this.put("period:lastEvent", key);
+        const st = this.settings(), who = st.userName || "The user", t = this.localNow().time;
+        const len = dayDiff(rec.startDate, rec.endDate) + 1;
+        const text = ev === "start" ? `[${t}] ${who} just marked in her period tracker: her period started today.` : `[${t}] ${who} just marked in her period tracker: her period ended today (it lasted ${len} day${len > 1 ? "s" : ""}, since ${rec.startDate}).`;
+        try {
+          const r = await this.pushBridge("session_activity", text, { actor: "user", origin: "period_tracker" });
+          told = !!r.ok;
+        } catch {}
       }
+    }
+    if (ev) {
+      const res = await this.periodGet().json();
+      return j({ ...res, told });
     }
     return this.periodGet();
   },
