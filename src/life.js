@@ -53,6 +53,10 @@ export const MAP_DEFAULTS = {
   reactToUser: true, // 你在地图上换了位置 → 过一会儿让他「看到」，自己决定要不要过来
   pastDaysEnabled: true, // 判断时给不给他看前几天的行程（标明「别照着重复」）；今天的行程不受影响，一直给
   pastDays: 3, // 给几天（1–7）
+  // 按需（ondemand）：平时什么都不做，你在 Session 里点「查看这天的行程」才按那天的聊天还原；
+  // 自动（auto）：隔几小时判断一次（原来的做法）
+  mode: "ondemand",
+  tellOnView: true, // 按需模式下你点「查看行程」时，像点赞一样告诉他一声（不告诉他生成了什么）
 };
 
 export const PLACE_KINDS = ["home", "work", "study", "cafe", "food", "shop", "park", "gym", "bar", "friend", "transit", "culture", "other"];
@@ -189,6 +193,11 @@ export const LifeMixin = {
       } catch (e) {
         return j({ ok: false, error: e.message }, 400);
       }
+    }
+    if (p === "/api/map/itinerary" && m === "POST") {
+      const b = await this.body(req);
+      const r = await this.mapItinerary(isoD(b.date) || this.localDate(), { regenerate: !!b.regenerate });
+      return j(r, r.ok ? 200 : 502);
     }
     if (p === "/api/map/check" && m === "POST") {
       const r = await this.mapDecide("manual");
@@ -469,6 +478,8 @@ export const LifeMixin = {
     m.quiet = (Array.isArray(m.quiet) ? m.quiet : []).filter((q) => hhmm(q?.start) && hhmm(q?.end)).slice(0, 4);
     m.pastDaysEnabled = m.pastDaysEnabled !== false;
     m.pastDays = Math.round(num(m.pastDays, 1, 7, 3));
+    m.mode = m.mode === "auto" ? "auto" : "ondemand";
+    m.tellOnView = m.tellOnView !== false;
     return m;
   },
   mapState() {
@@ -494,6 +505,7 @@ export const LifeMixin = {
       now: this.localNow().time,
       tz: this.tzName(),
       quietNow: inQuiet(this.mapSettings().quiet, this.localNow().time),
+      itins: this.get("map:itins", {}) || {}, // 按需模式下哪些天已经生成过行程 {date: {generatedAt, upTo}}
       characterName: st.characterName,
       userName: st.userName,
       kinds: PLACE_KINDS,
@@ -507,7 +519,8 @@ export const LifeMixin = {
     const all = this.get("settings", {});
     const cur = { ...MAP_DEFAULTS, ...(all.map || {}) };
     const n = { ...cur };
-    for (const k of ["enabled", "syncToUranus", "allowNewPlaces", "usePersona", "reactToUser", "pastDaysEnabled"]) if (b[k] !== undefined) n[k] = !!b[k];
+    for (const k of ["enabled", "syncToUranus", "allowNewPlaces", "usePersona", "reactToUser", "pastDaysEnabled", "tellOnView"]) if (b[k] !== undefined) n[k] = !!b[k];
+    if (b.mode === "auto" || b.mode === "ondemand") n.mode = b.mode;
     if (b.pastDays !== undefined) n.pastDays = Math.round(num(b.pastDays, 1, 7, 3));
     if (["low", "normal", "high"].includes(b.spontaneity)) n.spontaneity = b.spontaneity;
     for (const k of ["source", "profileId", "uranusProviderId", "model", "language"]) if (b[k] !== undefined) n[k] = str(b[k], 200);
@@ -550,7 +563,7 @@ export const LifeMixin = {
       // 你换了地方：过 5–25 分钟让他「看到」，自己决定要不要过来（不是每次都会来）
       const ms = this.mapSettings(), st = this.mapState();
       const pl = this.mapPlaces().find((x) => x.id === n.me.placeId);
-      if (changed && ms.enabled && ms.reactToUser && n.me.visible && pl && pl.id !== st.placeId) {
+      if (changed && ms.mode === "auto" && ms.enabled && ms.reactToUser && n.me.visible && pl && pl.id !== st.placeId) {
         this.put("map:state", { ...st, reactAt: Date.now() + Math.round((5 + Math.random() * 20) * 60000), reactPlace: pl.id });
       } else if (!n.me.visible && st.reactAt) {
         this.put("map:state", { ...st, reactAt: 0, reactPlace: "" });
@@ -676,7 +689,7 @@ export const LifeMixin = {
   /** 定时器每一跳都调；没到点 / 静默时间 / 没开就什么也不做（不调模型、不花 token） */
   async mapTick() {
     const ms = this.mapSettings();
-    if (!ms.enabled) return;
+    if (ms.mode !== "auto" || !ms.enabled) return; // 按需模式：平时完全不动、不调模型
     const ln = this.localNow();
     if (inQuiet(ms.quiet, ln.time)) return;
     const st = this.mapState(), now = Date.now();
@@ -797,6 +810,204 @@ export const LifeMixin = {
       try {
         this.add("notifications", { id: uid("n"), text: `地图位置更新失败（${reason}）：${String(e.message || e).slice(0, 200)}`, read: false, createdAt: nowIso(), activityDate: this.localDate() });
       } catch {}
+      return { ok: false, error: String(e.message || e) };
+    }
+  },
+
+  /* ═════════════ 按需模式：按那天的聊天还原他的行程 ═════════════ */
+
+  /** 那天你们在 iMessage 里的聊天（只读，从 Uranus 的会话存档里按时间挑出来） */
+  async mapChatFor(date) {
+    const st = this.settings();
+    const lib = await this.uranus("/api/memories");
+    const roles = lib.roles || [];
+    const key = this.orgSettings?.()?.roleKey || "";
+    const role = roles.find((r) => key && r.key === key) || roles.find((r) => normName(r.roleName) === normName(st.characterName)) || roles[0];
+    if (!role) return { lines: [], memories: [] };
+    const list = (await this.uranus("/api/sessions")).sessions || [];
+    const mine = list.filter((x) => x.roleId === role.roleId && (x.kind || "chat") === "chat").slice(0, 3);
+    const tz = this.tzName();
+    const dayOf = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms));
+    const timeOf = (ms) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(ms));
+    const msgs = [];
+    for (const sx of mine) {
+      try {
+        const full = await this.uranus(`/api/sessions/${encodeURIComponent(sx.id)}`);
+        for (const m of full.messages || []) {
+          const ms = Date.parse(m.ts || "");
+          if (!ms || dayOf(ms) !== date) continue;
+          const text = String(m.content || "").replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/\s+/g, " ").trim();
+          if (text) msgs.push({ ms, who: m.role === "assistant" ? st.characterName || "Him" : st.userName || "Her", text: text.slice(0, 260) });
+        }
+      } catch {}
+    }
+    msgs.sort((a, b) => a.ms - b.ms);
+    let lines = msgs.map((m) => `[${timeOf(m.ms)}] ${m.who}: ${m.text}`);
+    // 太长就均匀抽掉中间的，保留开头和结尾（一天的开始和现在最重要）
+    while (lines.join("\n").length > 9000 && lines.length > 20) lines = [...lines.slice(0, Math.floor(lines.length * 0.3)), ...lines.slice(Math.floor(lines.length * 0.3) + 1)];
+    let memories = [];
+    try {
+      const full = await this.uranus(`/api/memories/${encodeURIComponent(role.key)}`);
+      memories = (full.memories || []).filter((m) => String(m.date || this.dateOfMs?.(Number(m.timestamp) || 0) || "") === date).slice(-15).map((m) => String(m.content || "").trim().slice(0, 300)).filter(Boolean);
+    } catch {}
+    return { lines, memories };
+  },
+
+  /** 某天某个「HH:MM」（角色时区）对应的 ISO 时间 */
+  mapIsoAt(date, hm) {
+    const target = Date.parse(`${date}T${hm}:00Z`);
+    let guess = target;
+    for (let i = 0; i < 2; i++) {
+      const p = {};
+      for (const x of new Intl.DateTimeFormat("en-CA", { timeZone: this.tzName(), year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(guess))) p[x.type] = x.value;
+      guess -= Date.parse(`${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:00Z`) - target;
+    }
+    return new Date(guess).toISOString();
+  },
+
+  /**
+   * 按需还原一天：根据那天的聊天（最重要）、他的记忆、他在 Companion 里的日程，排出「几点在哪、在做什么」。
+   * 已经生成过的那天再点就是「补到现在」：前面的不动，只往后接。regenerate = 整天重来。
+   * 生成的内容不告诉他；只在你点的时候（tellOnView）像点赞一样告诉他「你查看了地图」。
+   */
+  async mapItinerary(date, { regenerate = false } = {}) {
+    const ms = this.mapSettings();
+    const ln = this.localNow();
+    if (date > ln.date) return { ok: false, error: "还没到这天" };
+    const isToday = date === ln.date;
+    const itins = this.get("map:itins", {}) || {};
+    const prevItin = itins[date];
+    const extend = !!prevItin && !regenerate && isToday;
+    if (prevItin && !regenerate && !isToday) return { ok: true, cached: true };
+    try {
+      const s = this.settings();
+      const name = s.characterName || "the character", userName = s.userName || "the user";
+      let places = this.mapPlaces();
+      if (!places.length && !ms.allowNewPlaces) throw new Error("地点表是空的：先在「地点」里加几个地方。");
+      let chat = { lines: [], memories: [] };
+      try {
+        chat = await this.mapChatFor(date);
+      } catch (e) {
+        chat.error = String(e.message || e).slice(0, 120);
+      }
+      const visits = this.list("mapVisits");
+      const fixed = visits.filter((v) => v.date === date && (v.by === "mcp" || v.by === "user"));
+      const kept = extend ? visits.filter((v) => v.date === date && v.by === "itinerary") : [];
+      const from = extend ? prevItin.upTo || "00:00" : "00:00";
+      const until = isToday ? ln.time : "23:59";
+      const weekday = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "long" }).format(new Date(date + "T12:00:00Z"));
+      const sched = this.list("schedule")
+        .filter((x) => x.owner === "character" && x.date === date)
+        .map((x) => `${x.time || "anytime"}${x.end ? `–${x.end}` : ""} ${x.text}${x.status && x.status !== "planned" ? ` [${x.status}]` : ""}`);
+      const placeLines = places.slice(0, 60).map((p) => `${p.id} | ${p.name} | ${p.kind}${p.note ? ` | ${p.note.slice(0, 80)}` : ""}${p.rooms?.length ? ` | rooms: ${p.rooms.map((r) => r.name).join(", ")}` : ""}`);
+      const persona = ms.usePersona ? String(s.agent?.persona || "").trim().slice(0, 1200) : "";
+      const pastDays = (ms.pastDaysEnabled ? Array.from({ length: ms.pastDays }, (_, i) => i + 1) : [])
+        .map((k) => {
+          const d = new Date(Date.parse(date + "T12:00:00Z") - k * 86400000).toISOString().slice(0, 10);
+          const vs = visits.filter((v) => v.date === d);
+          return vs.length ? `${d}: ${vs.map((v) => `${v.placeName}${v.activity ? ` (${v.activity.slice(0, 40)})` : ""}`).join(" → ")}` : "";
+        })
+        .filter(Boolean);
+      const fmt = (v) => `${v.startTime}${v.end ? `–${v.endTime}` : ""} ${v.placeName}${v.roomName ? ` (${v.roomName})` : ""}${v.activity ? ` — ${v.activity}` : ""}`;
+      const sys = [
+        `You reconstruct where ${name} physically was during ${isToday ? "today so far" : "one day"}, for a shared-location map that ${userName} looks at. Output a timeline of stops.`,
+        `The CHAT between ${name} and ${userName} that day is the source of truth: wherever he said he was, was going, or what he was doing, the timeline MUST match it (times included, as best you can tell). Don't contradict his schedule's fixed commitments either.`,
+        `For stretches the chat doesn't cover, fill in what he plausibly did, true to his persona, the weekday and the time of day. Days are not copies of each other: avoid replaying the same routine as previous days. Don't invent dramatic events.`,
+        ms.allowNewPlaces ? `Use known places when they fit; if he went somewhere not listed, add it via "newPlace" (short realistic name).` : `Only use known places.`,
+        `If a place has rooms, set the room when it's clear or natural.`,
+        `${ms.language ? `Write "activity" in ${ms.language}.` : `Write "activity" in the same language as the place names.`} Each activity is a short phrase (max 12 words).`,
+        `Stops are in time order, between ${from} and ${until}${isToday ? " (now)" : ""}. Each stop lasts until the next one starts. ${isToday ? "The last stop is where he is right now." : ""} Usually 3–8 stops for a full day; fewer for a short span. Sleeping at home overnight counts as a stop.`,
+        `Reply with ONLY JSON: {"stops":[{"start":"HH:MM","placeId":"<known id or empty>","newPlace":null|{"name":"...","kind":"${PLACE_KINDS.join("|")}"},"room":"<room name or empty>","activity":"..."}]${isToday ? "" : `,"endOfDay":"HH:MM"`}}`,
+      ].join("\n");
+      const user = [
+        persona ? `ABOUT ${name.toUpperCase()}:\n${persona}` : "",
+        `DAY: ${weekday} ${date} (${this.tzName()})${isToday ? `, now ${ln.time}` : ""}`,
+        `KNOWN PLACES (id | name | kind | note):\n${placeLines.join("\n") || "(none yet)"}`,
+        `CHAT THAT DAY (${chat.lines.length} messages):\n${chat.lines.join("\n") || (chat.error ? `(couldn't read the chat: ${chat.error})` : "(they didn't talk that day)")}`,
+        chat.memories.length ? `HIS MEMORIES FROM THAT DAY:\n${chat.memories.map((m) => "- " + m).join("\n")}` : "",
+        `HIS SCHEDULE THAT DAY:\n${sched.join("\n") || "(nothing scheduled)"}`,
+        fixed.length ? `ALREADY RECORDED (he or ${userName} set these; keep them, don't overlap):\n${fixed.map(fmt).join("\n")}` : "",
+        kept.length ? `ALREADY ESTABLISHED EARLIER TODAY (keep exactly; continue after ${from}; the first new stop may be the same place if he stayed):\n${kept.map(fmt).join("\n")}` : "",
+        pastDays.length ? `PREVIOUS DAYS (for variety; do NOT copy):\n${pastDays.join("\n")}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      const out = await this.callLLM({ source: ms.source, profileId: ms.profileId, uranusProviderId: ms.uranusProviderId, model: ms.model }, [{ role: "system", content: sys }, { role: "user", content: user }], 1800);
+      const d = parseJsonLoose(out);
+      const raw = (Array.isArray(d.stops) ? d.stops : []).filter((x) => hhmm(x?.start) && x.start >= from && x.start <= until).sort((a, b) => a.start.localeCompare(b.start));
+      if (!raw.length) throw new Error("模型没排出行程：" + out.slice(0, 160));
+      // 地点：已知 id / 名字 → 已知；否则按需新建
+      const stops = [];
+      for (const x of raw) {
+        places = this.mapPlaces();
+        let pl = places.find((p) => p.id === x.placeId) || places.find((p) => normName(p.name) === normName(x.placeId) || (x.newPlace && normName(p.name) === normName(x.newPlace.name)));
+        if (!pl && x.newPlace?.name && ms.allowNewPlaces) pl = this.mapAddPlace({ name: x.newPlace.name, kind: x.newPlace.kind }, "character");
+        if (!pl) continue;
+        const room = findRoom(pl, str(x.room, 40));
+        const act = str(x.activity, 160);
+        const last = stops[stops.length - 1];
+        // 连着两段在同一个地方：并成一段，换房间 / 换事情记进 log
+        if (last && last.pl.id === pl.id) last.log.push({ time: x.start, activity: act, room: room?.name || "" });
+        else stops.push({ pl, start: x.start, log: [{ time: x.start, activity: act, room: room?.name || "" }] });
+      }
+      if (!stops.length) throw new Error("模型排的地点都对不上：" + out.slice(0, 160));
+      const endOfDay = !isToday && hhmm(d.endOfDay) ? d.endOfDay : "23:59";
+      let all = visits.filter((v) => !(v.date === date && (v.by === "itinerary" || v.by === "model")) || (extend && v.by === "itinerary"));
+      // 补到现在：上一段如果和新的第一段是同一个地方，就接着这一段，不另起
+      let lastKept = extend ? all.filter((v) => v.date === date && v.by === "itinerary").sort((a, b) => a.start.localeCompare(b.start)).pop() : null;
+      const made = [];
+      stops.forEach((x, i) => {
+        const next = stops[i + 1];
+        const endHm = next ? next.start : isToday ? "" : endOfDay;
+        const logs = x.log.map((l) => ({ at: this.mapIsoAt(date, l.time), time: l.time, activity: l.activity, room: l.room }));
+        const lastLog = x.log[x.log.length - 1];
+        const lastRoom = findRoom(x.pl, lastLog.room);
+        if (i === 0 && lastKept && lastKept.placeId === x.pl.id) {
+          lastKept.log = [...(lastKept.log || []), ...logs].slice(-16);
+          Object.assign(lastKept, { activity: lastLog.activity || lastKept.activity, roomId: lastRoom?.id || lastKept.roomId, roomName: lastRoom?.name || lastKept.roomName, end: endHm ? this.mapIsoAt(date, endHm) : "", endTime: endHm, endDate: endHm ? date : "" });
+          made.push(lastKept);
+          return;
+        }
+        if (i === 0 && lastKept && !lastKept.end) Object.assign(lastKept, { end: this.mapIsoAt(date, x.start), endTime: x.start, endDate: date });
+        const v = { id: uid("vs"), placeId: x.pl.id, placeName: x.pl.name, kind: x.pl.kind, roomId: lastRoom?.id || "", roomName: lastRoom?.name || "", activity: lastLog.activity, start: this.mapIsoAt(date, x.start), date, startTime: x.start, end: endHm ? this.mapIsoAt(date, endHm) : "", endTime: endHm, endDate: endHm ? date : "", by: "itinerary", log: logs };
+        all.push(v);
+        made.push(v);
+      });
+      // 前一天跨进这一天的旧记录（比如自动模式下昨晚到今早一直在家）：截断在这天 0 点，免得和新排的重叠
+      if (!extend) {
+        const d0 = this.mapIsoAt(date, "00:00");
+        for (const v of all) if (v.date < date && v.by !== "mcp" && v.by !== "user" && (!v.end || v.end > d0)) Object.assign(v, { end: d0, endTime: "24:00", endDate: v.date });
+      }
+      all.sort((a, b) => String(a.start).localeCompare(String(b.start)));
+      // 今天：地图上的「他现在在哪」= 最后一段；之前没关的段（比如自动模式留下的）在新行程开始时关掉
+      if (isToday) {
+        const cur = made[made.length - 1];
+        const st = this.mapState();
+        for (const v of all) {
+          if (v.end || v.id === cur.id) continue;
+          // 以前没关的段：同一天的关在「现在这段」开始时；更早的日子关在那天 23:59
+          if (v.date === date) Object.assign(v, { end: cur.start > v.start ? cur.start : v.start, endTime: cur.start > v.start ? cur.startTime : v.startTime, endDate: date });
+          else Object.assign(v, { end: this.mapIsoAt(v.date, "23:59"), endTime: "23:59", endDate: v.date });
+        }
+        this.put("map:state", { ...st, placeId: cur.placeId, roomId: cur.roomId, activity: cur.activity, since: cur.start, visitId: cur.id, by: "itinerary", lastError: "" });
+      }
+      this.save("mapVisits", all.slice(-1500));
+      const nextItins = { ...itins, [date]: { generatedAt: nowIso(), upTo: isToday ? ln.time : "24:00" } };
+      for (const k of Object.keys(nextItins)) if (k < plusDays(ln.date, -90)) delete nextItins[k];
+      this.put("map:itins", nextItins);
+      // 你查看了地图 → 像点赞一样告诉他一声（不告诉他看到了什么）；30 分钟内同一天只说一次
+      let told = false;
+      const tk = `${date}`, lt = this.get("map:lastToldView", {}) || {};
+      if (ms.tellOnView && (!lt[tk] || Date.now() - lt[tk] > 30 * 60000)) {
+        const text = `[${ln.time}] ${userName} opened the shared map and checked where you've been ${isToday ? "today" : `on ${weekday}, ${date}`}.`;
+        try {
+          const r = await this.pushBridge("session_activity", text, { actor: "user", origin: "map_view" });
+          told = !!r.ok;
+          if (told) this.put("map:lastToldView", { [tk]: Date.now() });
+        } catch {}
+      }
+      return { ok: true, date, stops: made.length, chatMessages: chat.lines.length, chatError: chat.error || "", told };
+    } catch (e) {
       return { ok: false, error: String(e.message || e) };
     }
   },
