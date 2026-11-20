@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { LifeMixin, MAP_DEFAULTS } from "./life.js";
+import { SxjMixin } from "./shixinjie.js";
 
 const j = (data, status=200) => new Response(JSON.stringify(data), {status, headers:{"content-type":"application/json; charset=utf-8"}});
 const nowIso = () => new Date().toISOString();
@@ -36,6 +37,7 @@ export class Companion extends DurableObject {
     if(p==="/api/health") return j({ok:true});
     if(p==="/garden/feed"&&(m==="GET"||m==="OPTIONS")) return this.gardenFeed(req,u);
     if(p==="/garden/ingest"&&(m==="POST"||m==="OPTIONS")) return this.gardenIngest(req,u);
+    if(p==="/sxj/ingest"&&(m==="POST"||m==="GET"||m==="OPTIONS")) return this.sxjPublic(req,u);
     if(p==="/mcp") return this.mcpRoute(req,u);
     if(p.startsWith("/s/")&&m==="GET") return this.shareRoute(p,u);
     if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
@@ -92,6 +94,7 @@ export class Companion extends DurableObject {
     if(p==="/api/session/simplify"&&m==="POST") return this.simplifySession();
     if(p==="/api/session/simplified"&&m==="PUT") return this.saveSimplifiedSession(req);
     if(p==="/api/session/commit"&&m==="POST") return this.commitSession(req);
+    if(p.startsWith("/api/sxj/")){ const r=await this.sxjRoute(req,p,m); if(r)return r; }
     if(p.startsWith("/api/period")||p.startsWith("/api/focus")||p.startsWith("/api/map")||p.startsWith("/api/glass")){ const r=await this.lifeRoute(req,p,m); if(r)return r; }
     if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
     return j({ok:false,error:"Not found"},404);
@@ -1536,7 +1539,9 @@ Return ONLY JSON: {"posts":[{"ref":"exact ref","text":"...","imagePrompt":"..."}
     // 先把下一跳排上：这一跳里任何一步抛错，闹钟链都不会断（以前 arm 在最后，一抛错就再也不跳了）
     try{await this.arm();}catch{}
     try{ await this.runMomentJobs(); }catch{}
-    try{ await this.orgTick(); }catch{}
+    // 日记来源选了拾心界：不再从 Uranus 整理，改由拾心界的记录写日记
+    if(this.settings().diarySource==="shixinjie"){ try{ await this.sxjTick(); }catch{} }
+    else { try{ await this.orgTick(); }catch{} }
     try{ await this.mapTick(); }catch{}
     const deadline=Number(this.get("session:deadline",0))||0;if(deadline&&deadline<=Date.now()){try{await this.commitSession(new Request("https://local/api/session/commit",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({representation:"original",actions:[]})}))}catch{}}
     const st=this.settings(),tz=st.timezone||this.env.TZ||"America/New_York";this.pruneActivity();
@@ -1547,6 +1552,6 @@ Return ONLY JSON: {"posts":[{"ref":"exact ref","text":"...","imagePrompt":"..."}
   }
 }
 
-Object.assign(Companion.prototype, LifeMixin);
+Object.assign(Companion.prototype, LifeMixin, SxjMixin);
 
-export default { async scheduled(_ev,env,ctx){ ctx.waitUntil(env.COMPANION.get(env.COMPANION.idFromName("main")).wake().catch(()=>{})); }, async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")||u.pathname.startsWith("/garden/")||u.pathname.startsWith("/s/")||u.pathname==="/mcp"){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
+export default { async scheduled(_ev,env,ctx){ ctx.waitUntil(env.COMPANION.get(env.COMPANION.idFromName("main")).wake().catch(()=>{})); }, async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")||u.pathname.startsWith("/garden/")||u.pathname.startsWith("/sxj/")||u.pathname.startsWith("/s/")||u.pathname==="/mcp"){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
