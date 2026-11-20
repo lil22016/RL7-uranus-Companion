@@ -109,7 +109,16 @@ export const SxjMixin = {
   async sxjRoute(req, p, m) {
     if (p === "/api/sxj/info" && m === "GET") {
       const u = new URL(req.url);
-      return j({ ok: true, token: String(this.get("sxj:token", "") || ""), url: u.origin, mode: this.sxjMode() ? "shixinjie" : "uranus", cfg: this.sxjSettings(), state: this.get("sxj:state", {}) || {}, days: this.sxjDaySummary(), defaults: { premise: SXJ_PREMISE, glossary: SXJ_GLOSSARY } });
+      let uranusPaused = null, uranusError = "";
+      try {
+        uranusPaused = !!(await this.sxjUranusCall("GET", "/api/chat/pause")).paused;
+      } catch (e) {
+        uranusError = String(e.message || e).slice(0, 160);
+      }
+      const st = { ...(this.get("sxj:state", {}) || {}) };
+      if (st.lastError) st.lastError = /^\d{4}-\d{2}-\d{2}: /.test(st.lastError) ? st.lastError.slice(0, 12) + this.sxjNiceError(st.lastError.slice(12)) : this.sxjNiceError(st.lastError);
+      const days = this.sxjDaySummary().map((d) => (d.fail ? { ...d, fail: { ...d.fail, error: this.sxjNiceError(d.fail.error) } } : d));
+      return j({ ok: true, token: String(this.get("sxj:token", "") || ""), url: u.origin, mode: this.sxjMode() ? "shixinjie" : "uranus", uranusPaused, uranusError, cfg: this.sxjSettings(), state: st, days, defaults: { premise: SXJ_PREMISE, glossary: SXJ_GLOSSARY } });
     }
     if (p === "/api/sxj/token" && m === "POST") {
       const a = new Uint8Array(24);
@@ -121,6 +130,25 @@ export const SxjMixin = {
     if (p === "/api/sxj/token" && m === "DELETE") {
       this.put("sxj:token", "");
       return j({ ok: true });
+    }
+    /*
+     * 一键切换：日记来源 + Uranus 的「暂停回复」一起改。
+     *   拾心界 → Companion 用拾心界写日记，Uranus 暂停回复
+     *   Uranus → Companion 回到从 Uranus 整理，Uranus 恢复回复
+     * Companion 这边一定会改；Uranus 那边连不上就告诉你，让你去控制台手动改。
+     */
+    if (p === "/api/sxj/mode" && m === "POST") {
+      const b = await this.body(req);
+      const mode = b.mode === "shixinjie" ? "shixinjie" : "uranus";
+      const cur = this.get("settings", {}) || {};
+      this.put("settings", { ...cur, diarySource: mode });
+      let uranusPaused = null, uranusError = "";
+      try {
+        uranusPaused = !!(await this.sxjUranusCall("POST", "/api/chat/pause", { paused: mode === "shixinjie" })).paused;
+      } catch (e) {
+        uranusError = String(e.message || e).slice(0, 160);
+      }
+      return j({ ok: true, mode, uranusPaused, uranusError });
     }
     if (p === "/api/sxj/run" && m === "POST") {
       const b = await this.body(req);
@@ -149,6 +177,44 @@ export const SxjMixin = {
       return j({ ok: true, date, lines: this.sxjLines(date).split("\n").filter(Boolean) });
     }
     return null;
+  },
+
+  /* Uranus 的小请求（带 x-uranus-key），8 秒超时，不重试 */
+  async sxjUranusCall(method, path, body) {
+    const bridge = this.settings().bridge || {};
+    let origin = "";
+    try {
+      origin = new URL(String(bridge.url || "").trim()).origin;
+    } catch {}
+    if (!origin || !bridge.key) throw new Error("「Uranus 桥接」里还没填 Uranus 地址和后端密钥");
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 8000);
+    try {
+      const r = await fetch(origin + path, { method, signal: ac.signal, headers: { "x-uranus-key": bridge.key, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+      const t = await r.text();
+      let o = null;
+      try {
+        o = JSON.parse(t);
+      } catch {}
+      if (r.status === 404) throw new Error("Uranus 还没更新到有这个开关的版本，稍后再试");
+      if (!r.ok || !o) throw new Error(`Uranus 返回 HTTP ${r.status}${o?.error ? "：" + o.error : ""}`);
+      return o;
+    } catch (e) {
+      if (e?.name === "AbortError") throw new Error("连 Uranus 超时了");
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+  /* 模型报错 → 一句看得懂的话 */
+  sxjNiceError(e) {
+    const raw = String(e?.message || e || "");
+    if (/402|insufficient[_ ]balance|余额/i.test(raw)) return "模型账户余额不足（402）。去这个模型的服务商充值，或者在下面「写日记用的模型」换一个。";
+    if (/401|invalid[_ ]api[_ ]key|unauthori[sz]ed|incorrect api key/i.test(raw)) return "模型的 API Key 不对或过期了（401）。去「模型」里检查一下。";
+    if (/429|rate.?limit/i.test(raw)) return "模型那边限流了（429），过一会儿会自动重试。";
+    if (/timeout|timed out|超时/i.test(raw)) return "模型响应超时，过一会儿会自动重试。";
+    const m = /"message"\s*:\s*"([^"]{1,160})/.exec(raw);
+    return (m ? m[1] : raw).slice(0, 160);
   },
 
   /* ───────── 收数据 ───────── */
@@ -279,6 +345,7 @@ export const SxjMixin = {
     if (done && !force) return { ok: false, error: "这天的日记已经写过了（要重写就勾选「重写」）" };
     const log = this.sxjLines(date);
     if (!log.trim()) return { ok: false, error: "这天拾心界还没有任何记录" };
+    if (manual) this.ctx.storage.kv.delete(`sxj:fail:${date}`); // 手动点过就重新计数
     this.sxjBusy = true;
     const s = this.settings();
     const cfg = this.sxjSettings();
@@ -342,7 +409,7 @@ Return ONLY JSON: {"title":"optional, max 20 chars","diary":"...","todos":[...]}
       this.add("notifications", { id: id("n"), kind: "system", text: `✓ 拾心界日记写好了（${date}）· 明天的新活动 ${todos} 个`, read: false, createdAt: nowIso(), activityDate: this.localDate() });
       return { ok: true, date, diaryId, todos, title };
     } catch (e) {
-      const err = String(e.message || e).slice(0, 300);
+      const err = this.sxjNiceError(e);
       const f = this.get(`sxj:fail:${date}`, null) || { count: 0 };
       if (!manual) this.put(`sxj:fail:${date}`, { at: nowIso(), count: (f.count || 0) + 1, error: err });
       this.sxjNote({ lastError: `${date}: ${err}` });
